@@ -17,7 +17,7 @@ class AboutView(ctk.CTkFrame):
         container = ctk.CTkFrame(self, fg_color=COLORS["bg"])
         container.pack(fill="both", expand=True, padx=24, pady=20)
 
-        ctk.CTkLabel(container, text="Bili Downloader",
+        ctk.CTkLabel(container, text="Video Downloader",
                      font=FONTS["heading"],
                      fg_color="transparent",
                      text_color=COLORS["text"]).pack(anchor="w")
@@ -28,8 +28,8 @@ class AboutView(ctk.CTkFrame):
                      text_color=COLORS["text_dim"]).pack(anchor="w", pady=(2, 16))
 
         ctk.CTkLabel(container,
-                     text=("Bilibili 视频下载工具，支持批量下载、"
-                           "音画合并，基于 DrissionPage 浏览器自动化。"),
+                     text=("多平台视频下载工具，支持 Bilibili / 抖音 / 小红书，"
+                           "批量下载与音画合并，基于 DrissionPage 浏览器自动化。"),
                      font=FONTS["default"],
                      fg_color="transparent",
                      text_color=COLORS["text"],
@@ -42,7 +42,7 @@ class AboutView(ctk.CTkFrame):
                      text_color=COLORS["text"]).pack(anchor="w", pady=(0, 4))
 
         ctk.CTkLabel(container,
-                     text="Python  DrissionPage  MoviePy  CustomTkinter",
+                     text="Python  DrissionPage  ffmpeg  CustomTkinter",
                      font=FONTS["mono"],
                      fg_color="transparent",
                      text_color=COLORS["text_dim"]).pack(anchor="w", pady=(0, 16))
