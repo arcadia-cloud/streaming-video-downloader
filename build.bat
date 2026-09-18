@@ -17,6 +17,8 @@ echo.
 echo [2/3] Building executable...
 pyinstaller --noconfirm --onefile --windowed ^
     --collect-data customtkinter ^
+    --collect-data imageio_ffmpeg ^
+    --collect-binaries imageio_ffmpeg ^
     --name "BiliDownloader" ^
     main.py
 if %errorlevel% neq 0 (

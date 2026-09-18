@@ -2,8 +2,10 @@ import os
 import re
 import json
 import uuid
+import subprocess
+import shutil
 
-from moviepy import VideoFileClip, AudioFileClip
+import imageio_ffmpeg
 
 from core.http_client import http_get
 
@@ -31,9 +33,26 @@ class VideoDownloader:
 
     def _download_file(self, url: str, path: str):
         res, _ = http_get(url=url, headers=self.headers,
-                          timeout=10, parse_html=False)
+                          timeout=30, parse_html=False)
         with open(path, "wb") as f:
             f.write(res.content)
+
+    def _merge_audio_video(self, v_path: str, a_path: str, out_path: str):
+        """用 ffmpeg 无损合并视频和音频（速度远快于 MoviePy）。"""
+        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-i", v_path,
+            "-i", a_path,
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-strict", "experimental",
+            out_path,
+        ]
+        subprocess.run(cmd, check=True,
+                       stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
 
     def bili_download(self):
         folder = os.path.join(BASE_DIR, "bili_video")
@@ -50,14 +69,8 @@ class VideoDownloader:
             self._download_file(vid, v_path)
             self._download_file(aud, a_path)
 
-            video_clip = VideoFileClip(v_path)
-            audio_clip = AudioFileClip(a_path)
-            final = video_clip.with_audio(audio_clip)
             out_path = os.path.join(folder, f"{self.video_name}.mp4")
-            final.write_videofile(out_path)
-            final.close()
-            video_clip.close()
-            audio_clip.close()
+            self._merge_audio_video(v_path, a_path, out_path)
         finally:
             for p in (v_path, a_path):
                 if os.path.exists(p):
@@ -68,7 +81,7 @@ class VideoDownloader:
         os.makedirs(folder, exist_ok=True)
 
         res, _ = http_get(url=self.url, headers=self.headers,
-                          timeout=10, parse_html=False)
+                          timeout=30, parse_html=False)
         video_path = os.path.join(folder, f"{self.video_name}.mp4")
         with open(video_path, "wb") as f:
             f.write(res.content)
