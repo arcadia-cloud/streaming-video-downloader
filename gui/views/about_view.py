@@ -3,7 +3,7 @@ import customtkinter as ctk
 
 from gui.theme import COLORS, FONTS
 
-GITHUB_URL = "https://github.com/yourname/bili-downloader"
+GITHUB_URL = "https://github.com/arcadia-cloud/bili-downloader"
 
 
 class AboutView(ctk.CTkFrame):
