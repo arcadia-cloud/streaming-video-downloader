@@ -4,20 +4,19 @@ import threading
 from DrissionPage import ChromiumPage
 
 from core.dp_tools import DpTools
+from core.platforms import PLATFORMS
 
-BILI_HOME = "https://www.bilibili.com/"
-BILI_PREFIX = "https://www.bilibili.com/"
 LOGIN_TIMEOUT = 40
 LOGIN_WARN_COUNTDOWN = 10
-INVALID_CHARS = r'\/:*?"<>|'
 
 
 class BrowserManager:
-    """管理浏览器生命周期与 Bilibili 登录状态。"""
+    """管理浏览器生命周期与平台登录状态。"""
 
     def __init__(self):
         self.page: ChromiumPage | None = None
         self._logged_in = False
+        self.platform = PLATFORMS[0] if PLATFORMS else None
 
     @property
     def logged_in(self) -> bool:
@@ -25,7 +24,7 @@ class BrowserManager:
 
     def launch(self):
         self.page = ChromiumPage()
-        self.page.get(BILI_HOME)
+        self.page.get(self.platform.login_url())
         self.page._wait_loaded()
 
     def wait_for_login(self, on_status=None, on_countdown=None,
@@ -33,22 +32,21 @@ class BrowserManager:
         """等待用户登录，通过回调通知 GUI。"""
 
         def _worker():
-            user_tag = self.page.ele('xpath://div[@class="header-login-entry"]')
-
-            if not user_tag:
+            if self.platform.is_logged_in(self.page):
                 self._logged_in = True
                 if on_success:
                     on_success()
                 return
 
-            user_tag.click()
+            login_tag = self.page.ele(
+                'xpath://div[@class="header-login-entry"]'
+            )
+            if login_tag:
+                login_tag.click()
 
             for s in range(LOGIN_TIMEOUT):
                 time.sleep(1)
-                user_tag = self.page.ele(
-                    'xpath://div[@class="header-login-entry"]'
-                )
-                if not user_tag:
+                if self.platform.is_logged_in(self.page):
                     self._logged_in = True
                     if on_success:
                         on_success()
@@ -76,29 +74,23 @@ class BrowserManager:
         ).build_headers()
         return headers, tab
 
-    def get_video_name(self, tab) -> str | None:
-        name_tag = tab.ele(
-            'xpath://div[@class="video-info-title-inner"]/h1'
-        )
-        title = name_tag.attr('title') if name_tag else None
-        return self._sanitize_filename(title) if title else None
-
     @staticmethod
-    def _sanitize_filename(name: str) -> str:
-        if not name:
-            return "anonymous"
-        for c in INVALID_CHARS:
-            name = name.replace(c, '_')
-        return name
+    def get_platform_for_url(url: str):
+        """根据 URL 匹配对应的平台。"""
+        for p in PLATFORMS:
+            if p.match_url(url):
+                return p
+        return None
 
-    @staticmethod
-    def parse_urls(search: str) -> list[str]:
-        search = search.replace("\n", "|").replace("\r", "")
-        parts = [p.strip() for p in search.split("|") if p.strip()]
+    def parse_urls(self, text: str) -> list[str]:
+        """解析所有平台的合法链接，保持顺序去重。"""
+        text = text.replace("\n", "|").replace("\r", "")
+        parts = [p.strip() for p in text.split("|") if p.strip()]
         seen = set()
         urls = []
         for p in parts:
-            if p.startswith(BILI_PREFIX) and p not in seen:
+            platform = self.get_platform_for_url(p)
+            if platform and p not in seen:
                 seen.add(p)
                 urls.append(p)
         return urls

@@ -13,7 +13,7 @@ from gui.views.settings_view import SettingsView
 from gui.views.about_view import AboutView
 from core.browser import BrowserManager
 from core.dp_tools import DpTools
-from core.downloader import VideoDownloader
+from core.platforms import PLATFORMS
 
 
 class App(ctk.CTk):
@@ -28,7 +28,7 @@ class App(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("Bili Downloader")
+        self.title("Video Downloader")
         self.geometry("860x620")
         self.minsize(700, 500)
         self.configure(fg_color=COLORS["bg"])
@@ -57,7 +57,7 @@ class App(ctk.CTk):
         self.sidebar.pack_propagate(False)
 
         ctk.CTkLabel(
-            self.sidebar, text="Bili\nDownloader",
+            self.sidebar, text="Video\nDownloader",
             font=FONTS["subheading"],
             fg_color="transparent",
             text_color=COLORS["accent"],
@@ -79,11 +79,13 @@ class App(ctk.CTk):
             btn.pack(fill="x", padx=8, pady=2)
             self.nav_buttons[key] = btn
 
+        platform_names = " / ".join(p.display_name for p in PLATFORMS)
         ctk.CTkLabel(
-            self.sidebar, text="v1.0.0",
+            self.sidebar, text=f"v1.0.0\n{platform_names}",
             font=FONTS["small"],
             fg_color="transparent",
-            text_color=COLORS["text_dim"]).pack(side="bottom", padx=20, pady=16)
+            text_color=COLORS["text_dim"]).pack(
+                side="bottom", padx=20, pady=16)
 
     def _build_content(self):
         self.content = ctk.CTkFrame(
@@ -126,7 +128,8 @@ class App(ctk.CTk):
             try:
                 self.browser.launch()
                 self._set_state("waiting_login")
-                self.log("请在浏览器中登录 Bilibili")
+                platform_name = self.browser.platform.display_name
+                self.log(f"请在浏览器中登录 {platform_name}")
                 self.browser.wait_for_login(
                     on_status=self._on_login_wait,
                     on_countdown=self._on_login_countdown,
@@ -161,7 +164,8 @@ class App(ctk.CTk):
     def start_download(self, urls_text: str):
         urls = self.browser.parse_urls(urls_text)
         if not urls:
-            self.log("未检测到有效的 Bilibili 链接", "error")
+            supported = ", ".join(p.url_prefix for p in PLATFORMS)
+            self.log(f"未检测到有效链接，支持: {supported}", "error")
             return
 
         self._set_state("downloading")
@@ -172,6 +176,7 @@ class App(ctk.CTk):
             success = 0
             fail = 0
             for i, url in enumerate(urls):
+                platform = self.browser.get_platform_for_url(url)
                 self.log(f"[{i + 1}/{len(urls)}] {url}")
 
                 for plugin in self.plugins:
@@ -190,15 +195,11 @@ class App(ctk.CTk):
                         user_agent=video_page.user_agent,
                     ).build_headers()
 
-                    name = self.browser.get_video_name(video_page)
+                    name = platform.get_video_name(video_page)
                     if not name:
                         name = f"anonymous{i}"
 
-                    VideoDownloader(
-                        html=video_page.html,
-                        headers=headers,
-                        video_name=name,
-                    ).bili_download()
+                    platform.download(video_page, headers, name)
 
                     download_ok = True
                     success += 1
@@ -216,12 +217,15 @@ class App(ctk.CTk):
                     for plugin in self.plugins:
                         try:
                             out_dir = os.environ.get(
-                                "BILI_DOWNLOADER_DIR", r"D:\data")
+                                "BILI_DOWNLOADER_DIR", r"D:\data"
+                            )
                             out_path = os.path.join(
-                                out_dir, "bili_video",
-                                f"{name or 'unknown'}.mp4")
+                                out_dir, platform.sub_folder,
+                                f"{name or 'unknown'}.mp4"
+                            )
                             plugin.on_download_complete(
-                                url, out_path, download_ok)
+                                url, out_path, download_ok
+                            )
                         except Exception:
                             pass
 

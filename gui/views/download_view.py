@@ -38,7 +38,7 @@ class DownloadView(ctk.CTkFrame):
         self.url_input.pack(fill="x", pady=(4, 10))
         self.url_input.insert("1.0",
                               "每行一条链接，或用 | 分隔\n"
-                              "仅支持 https://www.bilibili.com/ 开头的链接")
+                              "支持 Bilibili / 抖音 / 小红书 链接")
         self.url_input.bind("<FocusIn>", self._clear_placeholder)
 
         self.action_btn = ctk.CTkButton(
