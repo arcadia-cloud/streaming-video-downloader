@@ -33,7 +33,10 @@ class SettingsView(ctk.CTkFrame):
                      text_color=COLORS["text"]).pack(side="left", padx=12)
 
         self.path_var = StringVar(
-            value=os.environ.get("BILI_DOWNLOADER_DIR", r"D:\data"))
+            value=os.environ.get(
+                "BILI_DOWNLOADER_DIR",
+                os.path.join(os.path.expanduser("~"), "video_downloader")
+            ))
         path_entry = ctk.CTkEntry(path_frame, textvariable=self.path_var,
                                   font=FONTS["mono"],
                                   fg_color=COLORS["surface_alt"],

@@ -191,9 +191,10 @@ class App(ctk.CTk):
                 try:
                     video_page = self.browser.page.new_tab(url)
                     headers = DpTools(
+                        ck_dict_li=video_page.cookies(),
                         referer=video_page.url,
                         user_agent=video_page.user_agent,
-                    ).build_headers()
+                    ).simp_cookie().build_headers()
 
                     name = platform.get_video_name(video_page)
                     if not name:
@@ -217,7 +218,8 @@ class App(ctk.CTk):
                     for plugin in self.plugins:
                         try:
                             out_dir = os.environ.get(
-                                "BILI_DOWNLOADER_DIR", r"D:\data"
+                                "BILI_DOWNLOADER_DIR",
+                                os.path.join(os.path.expanduser("~"), "video_downloader")
                             )
                             out_path = os.path.join(
                                 out_dir, platform.sub_folder,

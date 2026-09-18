@@ -83,16 +83,18 @@ class BrowserManager:
         return None
 
     def parse_urls(self, text: str) -> list[str]:
-        """解析所有平台的合法链接，保持顺序去重。"""
+        """解析所有平台的合法链接，自动补全简化链接，保持顺序去重。"""
         text = text.replace("\n", "|").replace("\r", "")
         parts = [p.strip() for p in text.split("|") if p.strip()]
         seen = set()
         urls = []
         for p in parts:
             platform = self.get_platform_for_url(p)
-            if platform and p not in seen:
-                seen.add(p)
-                urls.append(p)
+            if platform:
+                full = platform.normalize_url(p)
+                if full not in seen:
+                    seen.add(full)
+                    urls.append(full)
         return urls
 
     def quit(self):

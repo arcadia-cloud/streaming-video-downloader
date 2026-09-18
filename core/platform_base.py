@@ -11,7 +11,8 @@ class PlatformBase(ABC):
     """平台基类。每个平台（Bilibili / 抖音 / 小红书）继承此类。
 
     子类需要实现：
-    - match_url: 判断 URL 是否属于该平台
+    - match_url: 判断 URL 是否属于该平台（支持简化链接）
+    - normalize_url: 将简化链接补全为完整 URL
     - parse_urls: 从用户输入中提取该平台的合法链接
     - login_url: 登录页 URL
     - is_logged_in: 检测是否已登录
@@ -29,8 +30,18 @@ class PlatformBase(ABC):
 
     @abstractmethod
     def match_url(self, url: str) -> bool:
-        """判断 URL 是否属于该平台。"""
+        """判断 URL 是否属于该平台（支持简化的无前缀链接）。"""
         ...
+
+    def normalize_url(self, url: str) -> str:
+        """将简化链接补全为完整 https:// URL。
+
+        默认实现：如果缺少协议头，补上 https://。
+        子类可覆盖以处理更复杂的简化场景（如去掉的 www 前缀）。
+        """
+        if not url.startswith("http://") and not url.startswith("https://"):
+            return "https://" + url
+        return url
 
     @abstractmethod
     def parse_urls(self, text: str) -> list[str]:

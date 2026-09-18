@@ -13,12 +13,12 @@ from core.http_client import http_get
 
 BILI_HOME = "https://www.bilibili.com/"
 BILI_PREFIX = "https://www.bilibili.com/"
+BILI_DOMAIN = "bilibili.com"
 LOGIN_TIMEOUT = 40
 LOGIN_WARN_COUNTDOWN = 10
 
-# 覆盖自定义目录的环境变量名
 ENV_DIR_KEY = "BILI_DOWNLOADER_DIR"
-DEFAULT_DIR = r"D:\data"
+DEFAULT_DIR = os.path.join(os.path.expanduser("~"), "video_downloader")
 
 
 class BilibiliPlatform(PlatformBase):
@@ -28,7 +28,16 @@ class BilibiliPlatform(PlatformBase):
     sub_folder = "bili_video"
 
     def match_url(self, url: str) -> bool:
-        return url.startswith(BILI_PREFIX)
+        """支持完整链接和简化链接（无协议头、无 www）。"""
+        return BILI_DOMAIN in url
+
+    def normalize_url(self, url: str) -> str:
+        """将简化链接补全为完整 https://www.bilibili.com/ 链接。"""
+        if not url.startswith("http://") and not url.startswith("https://"):
+            url = "https://" + url
+        if url.startswith("https://bilibili.com"):
+            url = url.replace("https://bilibili.com", "https://www.bilibili.com")
+        return url
 
     def parse_urls(self, text: str) -> list[str]:
         text = text.replace("\n", "|").replace("\r", "")
@@ -36,9 +45,11 @@ class BilibiliPlatform(PlatformBase):
         seen = set()
         urls = []
         for p in parts:
-            if p.startswith(BILI_PREFIX) and p not in seen:
-                seen.add(p)
-                urls.append(p)
+            if self.match_url(p):
+                full = self.normalize_url(p)
+                if full not in seen:
+                    seen.add(full)
+                    urls.append(full)
         return urls
 
     def login_url(self) -> str:
