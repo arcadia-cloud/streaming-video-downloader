@@ -88,15 +88,12 @@ class DouyinPlatform(PlatformBase):
                 return self.sanitize_filename(texts[0])
         return None
 
-    def download(self, tab, headers: dict, video_name: str):
+    def download(self, tab, url: str, headers: dict, video_name: str):
         """自动识别视频/图文并下载。
 
-        先通过 API 监听获取 aweme_detail，判断是视频还是图文：
-        - 视频：从 play_addr.url_list 下载
-        - 图文：滑动加载所有页 → 监听所有图片请求 → 去重 → 过滤压缩图
+        关键：先导航到 about:blank 清空 SPA 状态，再启动监听，
+        最后导航到目标 URL，确保 aweme/detail API 在监听后触发。
         """
-        url = tab.url
-
         json_dict = self._listen_api(tab, url)
 
         if not json_dict:
@@ -124,8 +121,8 @@ class DouyinPlatform(PlatformBase):
             self._download_photos_api(headers, video_name, images)
             return
 
-        if "aweme_detail" not in json_dict and self._is_photo_page(tab):
-            self._download_photos_slide(tab, headers, video_name)
+        if self._is_photo_page(tab):
+            self._download_photos_slide(tab, url, headers, video_name)
             return
 
         raise ValueError("无法识别内容类型（非视频/图文）")
@@ -166,14 +163,12 @@ class DouyinPlatform(PlatformBase):
         )
         return bool(page_tag_list)
 
-    def _download_photos_slide(self, tab, headers: dict,
+    def _download_photos_slide(self, tab, url: str, headers: dict,
                                video_name: str):
         """图文下载：滑动加载所有页 → 监听图片请求 → 去重 → 过滤。
 
         保留原始滑动逻辑：抖音图文是懒加载，不滑动只能拿到部分图片。
         """
-        url = tab.url
-
         tab.listen.start("https://p3-pc-sign.douyinpic.com/tos-cn-i")
         tab.get(url)
 

@@ -195,18 +195,21 @@ class App(ctk.CTk):
                 name = None
                 download_ok = False
                 try:
-                    video_page = self.browser.page.new_tab(url)
+                    video_page = self.browser.page.new_tab()
                     headers = DpTools(
                         ck_dict_li=video_page.cookies(),
-                        referer=video_page.url,
+                        referer=url,
                         user_agent=video_page.user_agent,
                     ).simp_cookie().build_headers()
+
+                    video_page.get(url)
+                    video_page._wait_loaded()
 
                     name = platform.get_video_name(video_page)
                     if not name:
                         name = f"anonymous{i}"
 
-                    platform.download(video_page, headers, name)
+                    platform.download(video_page, url, headers, name)
 
                     download_ok = True
                     success += 1

@@ -75,7 +75,7 @@ class BilibiliPlatform(PlatformBase):
         title = name_tag.attr('title') if name_tag else None
         return self.sanitize_filename(title) if title else None
 
-    def download(self, tab, headers: dict, video_name: str):
+    def download(self, tab, url: str, headers: dict, video_name: str):
         html = tab.html
         folder = os.path.join(
             os.environ.get(ENV_DIR_KEY, DEFAULT_DIR), self.sub_folder

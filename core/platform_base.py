@@ -68,8 +68,8 @@ class PlatformBase(ABC):
         ...
 
     @abstractmethod
-    def download(self, tab, headers: dict, video_name: str):
-        """执行下载。"""
+    def download(self, tab, url: str, headers: dict, video_name: str):
+        """执行下载。由各平台自行导航，确保监听在导航前启动。"""
         ...
 
     @staticmethod
