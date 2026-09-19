@@ -53,6 +53,10 @@ class PlatformBase(ABC):
         """返回登录页 URL。"""
         ...
 
+    def click_login(self, page) -> bool:
+        """点击登录按钮（如需要）。子类可覆盖。"""
+        return False
+
     @abstractmethod
     def is_logged_in(self, page: ChromiumPage) -> bool:
         """检测是否已登录。"""

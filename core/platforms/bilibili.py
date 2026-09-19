@@ -55,6 +55,15 @@ class BilibiliPlatform(PlatformBase):
     def login_url(self) -> str:
         return BILI_HOME
 
+    def click_login(self, page) -> bool:
+        login_tag = page.ele(
+            'xpath://div[@class="header-login-entry"]'
+        )
+        if login_tag:
+            login_tag.click()
+            return True
+        return False
+
     def is_logged_in(self, page) -> bool:
         tag = page.ele('xpath://div[@class="header-login-entry"]')
         return not tag

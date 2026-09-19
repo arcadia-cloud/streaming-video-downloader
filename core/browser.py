@@ -22,6 +22,11 @@ class BrowserManager:
     def logged_in(self) -> bool:
         return self._logged_in
 
+    def set_platform(self, platform):
+        """切换当前平台。"""
+        self.platform = platform
+        self._logged_in = False
+
     def launch(self):
         self.page = ChromiumPage()
         self.page.get(self.platform.login_url())
@@ -38,11 +43,7 @@ class BrowserManager:
                     on_success()
                 return
 
-            login_tag = self.page.ele(
-                'xpath://div[@class="header-login-entry"]'
-            )
-            if login_tag:
-                login_tag.click()
+            self.platform.click_login(self.page)
 
             for s in range(LOGIN_TIMEOUT):
                 time.sleep(1)

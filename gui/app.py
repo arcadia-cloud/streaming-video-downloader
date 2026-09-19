@@ -81,7 +81,7 @@ class App(ctk.CTk):
 
         platform_names = " / ".join(p.display_name for p in PLATFORMS)
         ctk.CTkLabel(
-            self.sidebar, text=f"v1.0.0\n{platform_names}",
+            self.sidebar, text=f"v1.2.0\n{platform_names}",
             font=FONTS["small"],
             fg_color="transparent",
             text_color=COLORS["text_dim"]).pack(
@@ -120,9 +120,15 @@ class App(ctk.CTk):
         self._state = state
         self.download_view.set_state(state)
 
-    def start_browser(self):
+    def start_browser(self, platform_name: str = None):
+        if platform_name:
+            for p in PLATFORMS:
+                if p.display_name == platform_name:
+                    self.browser.set_platform(p)
+                    break
+
         self._set_state("launching")
-        self.log("正在启动浏览器…")
+        self.log(f"正在启动浏览器（{self.browser.platform.display_name}）…")
 
         def _launch():
             try:

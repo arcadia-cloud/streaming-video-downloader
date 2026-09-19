@@ -22,7 +22,7 @@ class AboutView(ctk.CTkFrame):
                      fg_color="transparent",
                      text_color=COLORS["text"]).pack(anchor="w")
 
-        ctk.CTkLabel(container, text="v1.0.0",
+        ctk.CTkLabel(container, text="v1.2.0",
                      font=FONTS["small"],
                      fg_color="transparent",
                      text_color=COLORS["text_dim"]).pack(anchor="w", pady=(2, 16))
