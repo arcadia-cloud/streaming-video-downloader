@@ -103,9 +103,11 @@ class DouyinPlatform(PlatformBase):
 
             if packet and packet.response.body:
                 body = packet.response.body
+                if isinstance(body, bytes):
+                    body = body.decode("utf-8")
                 if isinstance(body, str):
                     json_dict = json.loads(body)
-                else:
+                elif isinstance(body, dict):
                     json_dict = body
         except Exception:
             try:
