@@ -202,14 +202,11 @@ class App(ctk.CTk):
                         user_agent=video_page.user_agent,
                     ).simp_cookie().build_headers()
 
-                    video_page.get(url)
-                    video_page._wait_loaded()
-
-                    name = platform.get_video_name(video_page)
+                    name = platform.download(
+                        video_page, url, headers, f"anonymous{i}"
+                    )
                     if not name:
                         name = f"anonymous{i}"
-
-                    platform.download(video_page, url, headers, name)
 
                     download_ok = True
                     success += 1

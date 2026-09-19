@@ -88,72 +88,59 @@ class DouyinPlatform(PlatformBase):
                 return self.sanitize_filename(texts[0])
         return None
 
-    def download(self, tab, url: str, headers: dict, video_name: str):
-        """自动识别视频/图文并下载。
+    def download(self, tab, url: str, headers: dict, video_name: str) -> str:
+        """自动识别视频/图文并下载。返回实际使用的视频名。
 
-        关键：先导航到 about:blank 清空 SPA 状态，再启动监听，
-        最后导航到目标 URL，确保 aweme/detail API 在监听后触发。
+        严格还原原始流程：new_tab() 空标签页 → listen.start → get(url) → listen.wait
+        确保监听在导航前启动，API 响应才能被捕获。
         """
-        json_dict = self._listen_api(tab, url)
+        tab.listen.start("aweme/detail")
+        tab.get(url)
+
+        packet = tab.listen.wait(timeout=API_TIMEOUT)
+        tab.listen.stop()
+
+        json_dict = None
+        if packet and packet.response.body:
+            body = packet.response.body
+            if isinstance(body, bytes):
+                body = body.decode("utf-8")
+            if isinstance(body, str):
+                json_dict = json.loads(body)
+            elif isinstance(body, dict):
+                json_dict = body
 
         if not json_dict:
             json_dict = self._extract_from_html(tab.html)
 
         if not json_dict:
             raise ValueError(
-                "无法获取视频数据：API 监听超时且 HTML 解析失败，"
-                "可能是页面未完全加载或需要重新登录"
+                "无法获取视频数据：API 监听超时且 HTML 解析失败"
             )
 
         aweme = json_dict.get("aweme_detail", {})
         if not aweme:
             raise ValueError("API 响应中缺少 aweme_detail 字段")
 
+        name = self.get_video_name(tab) or video_name
+
         video_urls = (aweme.get("video", {})
                       .get("play_addr", {})
                       .get("url_list"))
         if video_urls:
-            self._download_video(headers, video_name, video_urls)
-            return
+            self._download_video(headers, name, video_urls)
+            return name
 
         images = aweme.get("images")
         if images:
-            self._download_photos_api(headers, video_name, images)
-            return
+            self._download_photos_api(headers, name, images)
+            return name
 
         if self._is_photo_page(tab):
-            self._download_photos_slide(tab, url, headers, video_name)
-            return
+            self._download_photos_slide(tab, url, headers, name)
+            return name
 
         raise ValueError("无法识别内容类型（非视频/图文）")
-
-    @staticmethod
-    def _listen_api(tab, url: str):
-        """监听 aweme/detail API，返回解析后的 dict 或 None。"""
-        json_dict = None
-        try:
-            tab.listen.start("aweme/detail")
-            tab.get("about:blank")
-            tab.get(url)
-            tab._wait_loaded()
-
-            packet = tab.listen.wait(timeout=API_TIMEOUT)
-            tab.listen.stop()
-
-            if packet and packet.response.body:
-                body = packet.response.body
-                if isinstance(body, bytes):
-                    body = body.decode("utf-8")
-                if isinstance(body, str):
-                    json_dict = json.loads(body)
-                elif isinstance(body, dict):
-                    json_dict = body
-        except Exception:
-            try:
-                tab.listen.stop()
-            except Exception:
-                pass
-        return json_dict
 
     @staticmethod
     def _is_photo_page(tab) -> bool:

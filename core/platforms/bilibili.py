@@ -75,7 +75,12 @@ class BilibiliPlatform(PlatformBase):
         title = name_tag.attr('title') if name_tag else None
         return self.sanitize_filename(title) if title else None
 
-    def download(self, tab, url: str, headers: dict, video_name: str):
+    def download(self, tab, url: str, headers: dict, video_name: str) -> str:
+        tab.get(url)
+        tab._wait_loaded()
+
+        name = self.get_video_name(tab) or video_name
+
         html = tab.html
         folder = os.path.join(
             os.environ.get(ENV_DIR_KEY, DEFAULT_DIR), self.sub_folder
@@ -92,12 +97,14 @@ class BilibiliPlatform(PlatformBase):
         try:
             self._download_file(vid, v_path, headers)
             self._download_file(aud, a_path, headers)
-            out_path = os.path.join(folder, f"{video_name}.mp4")
+            out_path = os.path.join(folder, f"{name}.mp4")
             self._merge_audio_video(v_path, a_path, out_path)
         finally:
             for p in (v_path, a_path):
                 if os.path.exists(p):
                     os.remove(p)
+
+        return name
 
     @staticmethod
     def _extract_media_url(html: str, key: str, next_key: str) -> str:
