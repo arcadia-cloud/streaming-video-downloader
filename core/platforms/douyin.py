@@ -84,32 +84,44 @@ class DouyinPlatform(PlatformBase):
     def download(self, tab, headers: dict, video_name: str):
         """自动识别视频/图文并下载。
 
-        先导航到 about:blank 清空 SPA 状态，再导航到目标 URL，
-        确保 aweme/detail API 重新触发（而非使用缓存）。
+        策略：先尝试 API 监听（导航到 about:blank 再回来强制刷新），
+        失败则从页面 HTML 中提取嵌入的 SSR/RENDER_DATA 数据。
         """
         url = tab.url
 
-        tab.listen.start("aweme/detail")
-        tab.get("about:blank")
-        tab.get(url)
+        json_dict = None
 
-        packet = tab.listen.wait(timeout=API_TIMEOUT)
-        tab.listen.stop()
+        # 策略 1: API 监听（先清空页面再导航，强制 API 重新触发）
+        try:
+            tab.listen.start("aweme")
+            tab.get("about:blank")
+            tab.get(url)
+            tab._wait_loaded()
 
-        if not packet:
+            packet = tab.listen.wait(timeout=API_TIMEOUT)
+            tab.listen.stop()
+
+            if packet and packet.response.body:
+                body = packet.response.body
+                if isinstance(body, str):
+                    json_dict = json.loads(body)
+                else:
+                    json_dict = body
+        except Exception:
+            try:
+                tab.listen.stop()
+            except Exception:
+                pass
+
+        # 策略 2: 从 HTML 提取嵌入数据
+        if not json_dict:
             json_dict = self._extract_from_html(tab.html)
-            if json_dict is None:
-                raise ValueError(
-                    "API 监听超时且 HTML 降级解析失败，"
-                    "可能是页面未完全加载或需要重新登录"
-                )
-        else:
-            json_dict = packet.response.body
-            if isinstance(json_dict, str):
-                json_dict = json.loads(json_dict)
 
         if not json_dict:
-            raise ValueError("API 返回空数据")
+            raise ValueError(
+                "无法获取视频数据：API 监听超时且 HTML 解析失败，"
+                "可能是页面未完全加载或需要重新登录"
+            )
 
         aweme = json_dict.get("aweme_detail", {})
         if not aweme:
@@ -131,26 +143,38 @@ class DouyinPlatform(PlatformBase):
 
     @staticmethod
     def _extract_from_html(html: str):
-        """从页面 HTML 中提取 aweme_detail 数据（降级方案）。
+        """从页面 HTML 中提取视频数据（降级方案）。
 
-        抖音 SPA 页面在 script 标签中嵌入了初始数据，
-        格式为 window._SSR_DATA 或 RENDER_DATA。
+        抖音 SPA 页面在 script 标签中嵌入初始数据，
+        尝试多种格式匹配。
         """
         patterns = [
-            r'"awemeDetail"\s*:\s*(\{.+?\})\s*,\s*"',
-            r'"aweme_detail"\s*:\s*(\{.+?\})\s*,\s*"',
-            r'RENDER_DATA\s*=\s*(\{.+?\})\s*</script>',
+            r'"awemeDetail"\s*:\s*(\{.+?\})\s*[,}]',
+            r'"aweme_detail"\s*:\s*(\{.+?\})\s*[,}]',
+            r'"video"\s*:\s*\{[^}]*"play_addr"\s*:\s*(\{.+?\})\s*[,}]',
+            r'play_addr["\']?\s*:\s*(\{.+?"url_list"\s*:\s*\[.+?\].+?\})',
         ]
         for pattern in patterns:
             match = re.search(pattern, html, flags=re.S)
             if match:
                 try:
                     data = json.loads(match.group(1))
-                    if "aweme_detail" in data:
-                        return data
-                    return {"aweme_detail": data}
+                    if "video" in data or "play_addr" in data:
+                        return {"aweme_detail": data}
+                    if "aweme_detail" not in data:
+                        return {"aweme_detail": data}
+                    return data
                 except (json.JSONDecodeError, IndexError):
                     continue
+
+        video_url_match = re.search(
+            r'"url_list"\s*:\s*\["(https?://[^"]+)"', html
+        )
+        if video_url_match:
+            return {"aweme_detail": {"video": {"play_addr": {
+                "url_list": [video_url_match.group(1)]
+            }}}}
+
         return None
 
     def _download_video(self, headers: dict, video_name: str,
