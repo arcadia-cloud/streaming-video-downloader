@@ -1,4 +1,8 @@
-"""抖音平台实现。支持视频和图文下载，自动识别内容类型。"""
+"""抖音平台实现。支持视频和图文下载，自动识别内容类型。
+
+图文下载保留原始滑动逻辑：通过滑动触发懒加载，监听所有图片请求，
+再去重、过滤压缩图、保留最高画质。
+"""
 
 import os
 import re
@@ -19,6 +23,9 @@ DEFAULT_DIR = os.path.join(os.path.expanduser("~"), "video_downloader")
 
 API_TIMEOUT = 30
 IMAGE_DOWNLOAD_DELAY = (0.3, 0.5)
+SLIDE_DELAY = (0.2, 0.3)
+SILENCE_CHECK_TIMEOUT = 6
+SILENCE_CHECK_RETRIES = 3
 
 
 class DouyinPlatform(PlatformBase):
@@ -84,38 +91,14 @@ class DouyinPlatform(PlatformBase):
     def download(self, tab, headers: dict, video_name: str):
         """自动识别视频/图文并下载。
 
-        策略：先尝试 API 监听（导航到 about:blank 再回来强制刷新），
-        失败则从页面 HTML 中提取嵌入的 SSR/RENDER_DATA 数据。
+        先通过 API 监听获取 aweme_detail，判断是视频还是图文：
+        - 视频：从 play_addr.url_list 下载
+        - 图文：滑动加载所有页 → 监听所有图片请求 → 去重 → 过滤压缩图
         """
         url = tab.url
 
-        json_dict = None
+        json_dict = self._listen_api(tab, url)
 
-        # 策略 1: API 监听（先清空页面再导航，强制 API 重新触发）
-        try:
-            tab.listen.start("aweme")
-            tab.get("about:blank")
-            tab.get(url)
-            tab._wait_loaded()
-
-            packet = tab.listen.wait(timeout=API_TIMEOUT)
-            tab.listen.stop()
-
-            if packet and packet.response.body:
-                body = packet.response.body
-                if isinstance(body, bytes):
-                    body = body.decode("utf-8")
-                if isinstance(body, str):
-                    json_dict = json.loads(body)
-                elif isinstance(body, dict):
-                    json_dict = body
-        except Exception:
-            try:
-                tab.listen.stop()
-            except Exception:
-                pass
-
-        # 策略 2: 从 HTML 提取嵌入数据
         if not json_dict:
             json_dict = self._extract_from_html(tab.html)
 
@@ -138,31 +121,165 @@ class DouyinPlatform(PlatformBase):
 
         images = aweme.get("images")
         if images:
-            self._download_photos(headers, video_name, images)
+            self._download_photos_api(headers, video_name, images)
+            return
+
+        if "aweme_detail" not in json_dict and self._is_photo_page(tab):
+            self._download_photos_slide(tab, headers, video_name)
             return
 
         raise ValueError("无法识别内容类型（非视频/图文）")
 
     @staticmethod
-    def _extract_from_html(html: str):
-        """从页面 HTML 中提取视频数据（降级方案）。
+    def _listen_api(tab, url: str):
+        """监听 aweme/detail API，返回解析后的 dict 或 None。"""
+        json_dict = None
+        try:
+            tab.listen.start("aweme/detail")
+            tab.get("about:blank")
+            tab.get(url)
+            tab._wait_loaded()
 
-        抖音 SPA 页面在 script 标签中嵌入初始数据，
-        尝试多种格式匹配。
+            packet = tab.listen.wait(timeout=API_TIMEOUT)
+            tab.listen.stop()
+
+            if packet and packet.response.body:
+                body = packet.response.body
+                if isinstance(body, bytes):
+                    body = body.decode("utf-8")
+                if isinstance(body, str):
+                    json_dict = json.loads(body)
+                elif isinstance(body, dict):
+                    json_dict = body
+        except Exception:
+            try:
+                tab.listen.stop()
+            except Exception:
+                pass
+        return json_dict
+
+    @staticmethod
+    def _is_photo_page(tab) -> bool:
+        """检测当前页面是否为图文类型。"""
+        page_tag_list = tab.eles(
+            'xpath://div[@data-e2e="player-container"]//span'
+        )
+        return bool(page_tag_list)
+
+    def _download_photos_slide(self, tab, headers: dict,
+                               video_name: str):
+        """图文下载：滑动加载所有页 → 监听图片请求 → 去重 → 过滤。
+
+        保留原始滑动逻辑：抖音图文是懒加载，不滑动只能拿到部分图片。
         """
+        url = tab.url
+
+        tab.listen.start("https://p3-pc-sign.douyinpic.com/tos-cn-i")
+        tab.get(url)
+
+        page_tag_list = tab.eles(
+            'xpath://div[@data-e2e="player-container"]//span'
+        )
+        if not page_tag_list:
+            tab.listen.stop()
+            raise ValueError("无法分析图文总页数")
+
+        prepro_list = [tag.text.strip() for tag in page_tag_list]
+        try:
+            total_page = int(
+                re.findall(r'/\s*(.{1,3})', "".join(prepro_list))[0]
+            )
+        except (ValueError, IndexError):
+            tab.listen.stop()
+            raise ValueError("解析图文总页数失败")
+
+        for _ in range(total_page):
+            se = random.uniform(0.05, 0.1)
+            x = random.randint(-350, -300)
+            tab.actions.move_to(
+                'xpath://div[@style="display: inline;"]'
+                ' | //div[@style="display:inline"]',
+                duration=0,
+            ).move(-300, 0, 0).hold().move(x, 0, se).release()
+            time.sleep(random.uniform(*SLIDE_DELAY))
+
+        for _ in range(SILENCE_CHECK_RETRIES):
+            silence_check = tab.listen.wait_silent(
+                timeout=SILENCE_CHECK_TIMEOUT, targets_only=True,
+            )
+            if silence_check:
+                break
+
+        packet_list = tab.listen.wait(
+            timeout=3, count=total_page + 5, fit_count=False,
+        )
+        tab.listen.stop()
+
+        if not packet_list:
+            raise ValueError("图文 API 监听未捕获到任何数据包")
+
+        raw_pic_url_set = {pkt.url for pkt in packet_list}
+        pic_url_set = {
+            u for u in raw_pic_url_set if "FAVORITE" not in u
+        }
+
+        diction: dict[str, str] = {}
+        dup_set: set[str] = set()
+        for pic_url in pic_url_set:
+            match = re.findall(
+                r'/tos-cn-i.*?/(.*?)(?=~tplv|~noop)', pic_url,
+            )
+            if match:
+                pic_unitag = match[0]
+                if pic_unitag in diction:
+                    dup_set.add(diction[pic_unitag])
+                    dup_set.add(pic_url)
+                else:
+                    diction[pic_unitag] = pic_url
+
+        remove_set = {
+            dup_url for dup_url in dup_set if "q75.webp?" in dup_url
+        }
+        pic_url_list = list(pic_url_set - remove_set)
+
+        folder = os.path.join(
+            os.environ.get(ENV_DIR_KEY, DEFAULT_DIR),
+            self.photo_sub_folder,
+        )
+        os.makedirs(folder, exist_ok=True)
+        photo_folder = os.path.join(folder, video_name)
+        os.makedirs(photo_folder, exist_ok=True)
+
+        index = 1
+        for pic_url in pic_url_list:
+            try:
+                res, _ = http_get(
+                    url=pic_url, headers=headers,
+                    timeout=30, parse_html=False,
+                )
+                path = os.path.join(photo_folder, f"{index}.jpg")
+                with open(path, "wb") as f:
+                    f.write(res.content)
+                index += 1
+                time.sleep(random.uniform(*IMAGE_DOWNLOAD_DELAY))
+            except Exception:
+                continue
+
+        if index == 1:
+            raise RuntimeError("所有图片下载均失败")
+
+    @staticmethod
+    def _extract_from_html(html: str):
+        """从页面 HTML 中提取视频数据（降级方案）。"""
         patterns = [
             r'"awemeDetail"\s*:\s*(\{.+?\})\s*[,}]',
             r'"aweme_detail"\s*:\s*(\{.+?\})\s*[,}]',
-            r'"video"\s*:\s*\{[^}]*"play_addr"\s*:\s*(\{.+?\})\s*[,}]',
-            r'play_addr["\']?\s*:\s*(\{.+?"url_list"\s*:\s*\[.+?\].+?\})',
         ]
         for pattern in patterns:
             match = re.search(pattern, html, flags=re.S)
             if match:
                 try:
                     data = json.loads(match.group(1))
-                    if "video" in data or "play_addr" in data:
-                        return {"aweme_detail": data}
                     if "aweme_detail" not in data:
                         return {"aweme_detail": data}
                     return data
@@ -176,7 +293,6 @@ class DouyinPlatform(PlatformBase):
             return {"aweme_detail": {"video": {"play_addr": {
                 "url_list": [video_url_match.group(1)]
             }}}}
-
         return None
 
     def _download_video(self, headers: dict, video_name: str,
@@ -206,14 +322,14 @@ class DouyinPlatform(PlatformBase):
             f"所有视频 CDN 地址下载均失败: {'; '.join(errors)}"
         )
 
-    def _download_photos(self, headers: dict, video_name: str,
-                         images: list):
-        """下载图文图片，每张尝试多个 URL 取最高画质。"""
+    def _download_photos_api(self, headers: dict, video_name: str,
+                             images: list):
+        """当 API 直接返回 images 字段时的图片下载。"""
         folder = os.path.join(
-            os.environ.get(ENV_DIR_KEY, DEFAULT_DIR), self.photo_sub_folder
+            os.environ.get(ENV_DIR_KEY, DEFAULT_DIR),
+            self.photo_sub_folder,
         )
         os.makedirs(folder, exist_ok=True)
-
         photo_folder = os.path.join(folder, video_name)
         os.makedirs(photo_folder, exist_ok=True)
 
