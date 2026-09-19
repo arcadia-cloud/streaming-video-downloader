@@ -17,7 +17,7 @@ SHARE_URL_PATTERN = r'https?://v\.douyin\.com/[^\s|,]+'
 ENV_DIR_KEY = "BILI_DOWNLOADER_DIR"
 DEFAULT_DIR = os.path.join(os.path.expanduser("~"), "video_downloader")
 
-API_TIMEOUT = 15
+API_TIMEOUT = 30
 IMAGE_DOWNLOAD_DELAY = (0.3, 0.5)
 
 
@@ -82,22 +82,34 @@ class DouyinPlatform(PlatformBase):
         return None
 
     def download(self, tab, headers: dict, video_name: str):
-        """自动识别视频/图文并下载。"""
+        """自动识别视频/图文并下载。
+
+        先导航到 about:blank 清空 SPA 状态，再导航到目标 URL，
+        确保 aweme/detail API 重新触发（而非使用缓存）。
+        """
+        url = tab.url
+
         tab.listen.start("aweme/detail")
-        tab.get(tab.url)
+        tab.get("about:blank")
+        tab.get(url)
 
         packet = tab.listen.wait(timeout=API_TIMEOUT)
         tab.listen.stop()
 
         if not packet:
-            raise ValueError("API 监听超时，未捕获到 aweme/detail 响应")
+            json_dict = self._extract_from_html(tab.html)
+            if json_dict is None:
+                raise ValueError(
+                    "API 监听超时且 HTML 降级解析失败，"
+                    "可能是页面未完全加载或需要重新登录"
+                )
+        else:
+            json_dict = packet.response.body
+            if isinstance(json_dict, str):
+                json_dict = json.loads(json_dict)
 
-        json_dict = packet.response.body
         if not json_dict:
             raise ValueError("API 返回空数据")
-
-        if isinstance(json_dict, str):
-            json_dict = json.loads(json_dict)
 
         aweme = json_dict.get("aweme_detail", {})
         if not aweme:
@@ -116,6 +128,30 @@ class DouyinPlatform(PlatformBase):
             return
 
         raise ValueError("无法识别内容类型（非视频/图文）")
+
+    @staticmethod
+    def _extract_from_html(html: str):
+        """从页面 HTML 中提取 aweme_detail 数据（降级方案）。
+
+        抖音 SPA 页面在 script 标签中嵌入了初始数据，
+        格式为 window._SSR_DATA 或 RENDER_DATA。
+        """
+        patterns = [
+            r'"awemeDetail"\s*:\s*(\{.+?\})\s*,\s*"',
+            r'"aweme_detail"\s*:\s*(\{.+?\})\s*,\s*"',
+            r'RENDER_DATA\s*=\s*(\{.+?\})\s*</script>',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, html, flags=re.S)
+            if match:
+                try:
+                    data = json.loads(match.group(1))
+                    if "aweme_detail" in data:
+                        return data
+                    return {"aweme_detail": data}
+                except (json.JSONDecodeError, IndexError):
+                    continue
+        return None
 
     def _download_video(self, headers: dict, video_name: str,
                         video_urls: list):
