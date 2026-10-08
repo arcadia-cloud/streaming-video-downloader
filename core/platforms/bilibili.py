@@ -55,17 +55,19 @@ class BilibiliPlatform(PlatformBase):
     def login_url(self) -> str:
         return BILI_HOME
 
+    UNLOGIN_ENTRY_XPATH = (
+        'xpath://div[contains(@class,"header-avatar-unlogin-entry")]'
+    )
+
     def click_login(self, page) -> bool:
-        login_tag = page.ele(
-            'xpath://div[@class="header-login-entry"]'
-        )
+        login_tag = page.ele(self.UNLOGIN_ENTRY_XPATH)
         if login_tag:
             login_tag.click()
             return True
         return False
 
     def is_logged_in(self, page) -> bool:
-        tag = page.ele('xpath://div[@class="header-login-entry"]')
+        tag = page.ele(self.UNLOGIN_ENTRY_XPATH)
         return not tag
 
     def get_video_name(self, tab) -> str | None:
