@@ -1,0 +1,408 @@
+﻿warning: in the working copy of 'video-downloader-v8\gui\app.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'video-downloader-v9\gui\app.py', LF will be replaced by CRLF the next time Git touches it
+--- "a/video-downloader-v8\\gui\\app.py"
++++ "b/video-downloader-v9\\gui\\app.py"
+@@ -21,6 +21,7 @@ from core import config as app_config
+ from core import media
+ from core.browser import BrowserManager
+ from core.platforms import PLATFORMS
++from core.platforms.bilibili import parse_parts
+ from gui.theme import COLORS, FONTS
+ from gui.views.about_view import AboutView
+ from gui.views.download_view import DownloadView
+@@ -404,12 +405,31 @@ class App(ctk.CTk):
+         if not self._confirm_platform(tasks):
+             return None
+ 
+-        selected = self.download_view.get_parts_selection()
+-        return [
+-            (platform, url,
+-             {"collect": platform.name == "bilibili" and url in selected})
+-            for platform, url in tasks
+-        ]
++        # B 站：勾选的链接按用户填的集数取分P；勾了但留空表示"全部"
++        ranges = self.download_view.get_parts_ranges()
++        bad: list[str] = []
++        built: list[tuple] = []
++        for platform, url in tasks:
++            options: dict = {}
++            if platform.name == "bilibili" and url in ranges:
++                parsed = parse_parts(ranges[url])
++                if parsed is None:
++                    bad.append(f"{url[:48]} → “{ranges[url]}”")
++                    continue
++                options = {"collect": True, "parts": parsed}
++            built.append((platform, url, options))
++
++        if bad:
++            messagebox.showwarning(
++                "集数范围无法解析",
++                "下面这些链接的集数范围看不懂：\n\n"
++                + "\n".join(bad[:4])
++                + "\n\n可用写法：3-7 / 1,3,5 / 7-（留空表示全部）",
++                parent=self,
++            )
++            return None
++
++        return built
+ 
+     def _confirm_platform(self, tasks: list[tuple]) -> bool:
+         """链接平台与当前选择不一致时先问一句，避免"选错平台"白跑一趟。"""
+warning: in the working copy of 'video-downloader-v8\gui\views\download_view.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'video-downloader-v9\gui\views\download_view.py', LF will be replaced by CRLF the next time Git touches it
+--- "a/video-downloader-v8\\gui\\views\\download_view.py"
++++ "b/video-downloader-v9\\gui\\views\\download_view.py"
+@@ -12,7 +12,11 @@ from gui.theme import COLORS, FAMILY, FONTS, RADIUS, resolve
+ from gui.widgets import (Card, EmptyState, QueueRow, Segmented, primary_button,
+                          text_button)
+ 
+-PLACEHOLDER = "粘贴视频链接，每行一条；也可以直接粘抖音分享文案，或把多条链接连着粘进来"
++PLACEHOLDER_DEFAULT = "粘贴视频链接，每行一条；多条可以换行或空格分开"
++PLACEHOLDER_BY_PLATFORM = {
++    "bilibili": "粘贴 Bilibili 链接；合集可勾选并填 3-7 / 1,3,5 选择要下的分P",
++    "douyin": "粘贴抖音链接，每行一条；也可以直接粘分享文案",
++}
+ 
+ 
+ class DownloadView(ctk.CTkFrame):
+@@ -30,6 +34,8 @@ class DownloadView(ctk.CTkFrame):
+         self._platform_name = PLATFORMS[0].name if PLATFORMS else ""
+         self._parts_signature: tuple[str, ...] = ()
+         self._parts_checked: set[str] = set()
++        self._parts_ranges: dict[str, str] = {}
++        self._parts_rows: dict[str, tuple] = {}
+         self._parts_timer = None
+ 
+         self._build_footer()
+@@ -388,7 +394,9 @@ class DownloadView(ctk.CTkFrame):
+     def _show_placeholder(self) -> None:
+         self.textbox.configure(state="normal")
+         self.textbox.delete("1.0", "end")
+-        self.textbox.insert("1.0", PLACEHOLDER, "placeholder")
++        hint = PLACEHOLDER_BY_PLATFORM.get(self._platform_name,
++                                           PLACEHOLDER_DEFAULT)
++        self.textbox.insert("1.0", hint, "placeholder")
+         self.textbox.tag_config("placeholder",
+                                 foreground=resolve(COLORS["text_faint"]))
+         self._placeholder_on = True
+@@ -473,6 +481,8 @@ class DownloadView(ctk.CTkFrame):
+ 
+     def _on_platform_change(self, name: str) -> None:
+         self._platform_name = name
++        if self._placeholder_on:
++            self._show_placeholder()        # 提示词要跟着平台换
+         text = "" if self._placeholder_on else self.textbox.get("1.0", "end-1c")
+         urls = self.app.browser.parse_urls(text) if text.strip() else []
+         self.refresh_parts(urls, force=True)
+@@ -499,6 +509,10 @@ class DownloadView(ctk.CTkFrame):
+             return
+         self._parts_signature = signature
+ 
++        # 重建前先把已填的范围读进缓存，避免输入内容丢失
++        for url, (_var, entry) in self._parts_rows.items():
++            self._parts_ranges[url] = entry.get().strip()
++        self._parts_rows.clear()
+         for child in self.parts_host.winfo_children():
+             child.destroy()
+         self._parts_checked &= set(urls)
+@@ -510,26 +524,52 @@ class DownloadView(ctk.CTkFrame):
+             self._parts_checked.add(urls[0])      # 默认第一条
+ 
+         for index, url in enumerate(urls, 1):
++            row = ctk.CTkFrame(self.parts_host, fg_color="transparent")
++            row.pack(fill="x", padx=6, pady=2)
++
+             var = tk.BooleanVar(value=url in self._parts_checked)
+             ctk.CTkCheckBox(
+-                self.parts_host, text=f"{index}. {_shorten_url(url)}",
+-                variable=var, font=FONTS["tiny"],
+-                text_color=COLORS["text_dim"], fg_color=COLORS["accent"],
+-                checkbox_width=16, checkbox_height=16,
+-                command=lambda u=url, v=var: self._toggle_part(u, v),
+-            ).pack(anchor="w", padx=6, pady=2)
++                row, text=f"{index}. {_shorten_url(url)}", variable=var,
++                font=FONTS["tiny"], text_color=COLORS["text_dim"],
++                fg_color=COLORS["accent"], checkbox_width=16,
++                checkbox_height=16,
++                command=lambda u=url: self._on_part_toggle(u),
++            ).pack(side="left")
++
++            entry = ctk.CTkEntry(
++                row, width=96, height=24, font=FONTS["tiny"],
++                fg_color=COLORS["surface_3"], border_width=0,
++                placeholder_text="全部", text_color=COLORS["text"],
++            )
++            entry.pack(side="right")
++            entry.insert(0, self._parts_ranges.get(url, ""))
++            entry.configure(state="normal" if var.get() else "disabled")
++            self._parts_rows[url] = (var, entry)
++
+         self.parts_frame.pack(fill="x", pady=(10, 0))
+ 
+-    def _toggle_part(self, url: str, var) -> None:
++    def _on_part_toggle(self, url: str) -> None:
++        row = self._parts_rows.get(url)
++        if row is None:
++            return
++        var, entry = row
+         if var.get():
+             self._parts_checked.add(url)
++            entry.configure(state="normal")
+         else:
+             self._parts_checked.discard(url)
++            self._parts_ranges[url] = entry.get().strip()
++            entry.configure(state="disabled")
+ 
+-    def get_parts_selection(self) -> set[str]:
++    def get_parts_ranges(self) -> dict[str, str]:
++        """勾选的链接 -> 用户填的集数范围（空串表示全部）。"""
+         if self._platform_name != "bilibili":
+-            return set()
+-        return set(self._parts_checked)
++            return {}
++        ranges: dict[str, str] = {}
++        for url, (var, entry) in self._parts_rows.items():
++            if var.get():
++                ranges[url] = entry.get().strip()
++        return ranges
+ 
+ 
+ def _shorten_url(url: str, limit: int = 56) -> str:
+warning: in the working copy of 'video-downloader-v8\core\platforms\bilibili.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'video-downloader-v9\core\platforms\bilibili.py', LF will be replaced by CRLF the next time Git touches it
+--- "a/video-downloader-v8\\core\\platforms\\bilibili.py"
++++ "b/video-downloader-v9\\core\\platforms\\bilibili.py"
+@@ -10,9 +10,10 @@
+ 
+ v8 增加合集 / 分P：
+ - 链接里的 `?p=N` 只决定从哪一集开始看，不代表整部合集；
+-- `options={"collect": True}` 时读 `__INITIAL_STATE__.videoData.pages`，
+-  按 P 逐集下载到 `<标题>/01_分P标题.mp4`；
+-- 不是合集却勾了合集，只提示并回退到单集，不当作错误。
++- `options={"parts": [3, 4, 5]}` 时读 `__INITIAL_STATE__.videoData.pages`，
++  只下载用户点名的分P，存到 `<标题>/03_分P标题.mp4`；
++- `parts` 为空表示"按原链接下当前这一集"；
++- 点名的分P不存在只提示并跳过，不当作整条失败。
+ """
+ 
+ from __future__ import annotations
+@@ -112,12 +113,28 @@ class BilibiliPlatform(PlatformBase):
+         self._open(tab, url)
+         name = self.get_video_name(tab) or self.sanitize_filename(fallback_name)
+ 
+-        if options.get("collect"):
+-            pages = self._pages(tab.html)
+-            if len(pages) > 1:
+-                return self._download_pages(tab, url, headers, name, pages,
+-                                            on_progress, log)
+-            log("该链接没有分P/合集，按单个视频处理", "warn")
++        wanted = options.get("parts") or []
++        collect = bool(options.get("collect"))
++        pages = self._pages(tab.html)
++
++        if collect:
++            if len(pages) <= 1:
++                log("该链接只有 1 个分P，已忽略集数选择", "warn")
++            else:
++                chosen, missing = self._select_pages(pages, wanted)
++                numbers = [int(page.get("page") or 0) for page in pages]
++                top = max(numbers) if numbers else 0
++                beyond = [n for n in wanted if n > top]
++                if beyond:
++                    log(f"集数范围超出实际分P数（共 {top} 集），"
++                        f"多出的 {len(beyond)} 个已忽略", "warn")
++                if missing:
++                    log("第 " + "、".join(str(n) for n in missing[:6])
++                        + " 集不存在，已跳过", "warn")
++                if chosen:
++                    return self._download_pages(tab, url, headers, name,
++                                                chosen, on_progress, log)
++                log("指定的集数都不存在，改为下载当前分P", "error")
+ 
+         path, quality, cid = self._save_one(
+             tab.html, headers, name, self.folder(), on_progress, log,
+@@ -184,7 +201,7 @@ class BilibiliPlatform(PlatformBase):
+         for index, page in enumerate(pages[:total], 1):
+             number = page.get("page") or index
+             title = self.sanitize_filename(page.get("part") or f"P{number}")
+-            stem = f"{index:02d}_{title}"
++            stem = f"{number:02d}_{title}"
+             self._open(tab, f"{base}?p={number}")
+             try:
+                 path, _quality, _cid = self._save_one(
+@@ -222,6 +239,27 @@ class BilibiliPlatform(PlatformBase):
+         pages = video.get("pages") or []
+         return [page for page in pages if isinstance(page, dict)]
+ 
++    @staticmethod
++    def _select_pages(pages: list[dict],
++                      wanted: list[int]) -> tuple[list[dict], list[int]]:
++        """按用户填的集数挑分P。
++
++        - 空列表表示"全部分P"
++        - 只报告"合集内部缺失"的集数；超出总集数的部分由调用方单独提示，
++          否则 `7-` 这种开区间会刷出一长串"不存在"
++        """
++        if not wanted:
++            return list(pages), []
++
++        numbers = [int(page.get("page") or 0) for page in pages]
++        existing = set(numbers)
++        top = max(numbers) if numbers else 0
++        wanted_set = set(wanted)
++        chosen = [page for page, number in zip(pages, numbers)
++                  if number in wanted_set]
++        missing = [n for n in wanted if n not in existing and n <= top]
++        return chosen, missing
++
+     @staticmethod
+     def _initial_state(html: str) -> dict | None:
+         """`__INITIAL_STATE__` 不是严格 JSON（含 undefined），先替换再解析。"""
+@@ -281,6 +319,44 @@ class BilibiliPlatform(PlatformBase):
+         return None
+ 
+ 
++def parse_parts(text: str) -> list[int] | None:
++    """把 "3-7,9" 解析成集数列表。
++
++    - 空串返回 []（表示"全部"，由调用方决定）
++    - "3-7" 闭区间；"7-" 表示 7 到上限；"1,3,5" 离散
++    - 无法解析返回 None（由界面报错，不静默变成"全部"）
++    """
++    raw = (text or "").strip().replace("，", ",").replace(" ", "")
++    if not raw:
++        return []
++
++    numbers: list[int] = []
++    for chunk in raw.split(","):
++        if not chunk:
++            continue
++        if "-" in chunk:
++            head, _, tail = chunk.partition("-")
++            if not head.isdigit():
++                return None
++            if tail and not tail.isdigit():
++                return None
++            start = int(head)
++            end = min(int(tail), MAX_PARTS) if tail else MAX_PARTS
++            if start < 1 or end < start:
++                return None
++            numbers.extend(range(start, end + 1))
++        else:
++            if not chunk.isdigit():
++                return None
++            value = int(chunk)
++            if value < 1:
++                return None
++            numbers.append(value)
++
++    unique = sorted(set(numbers))
++    return unique or None
++
++
+ def _urls_of(item: dict) -> list[str]:
+     """baseUrl + backupUrl（兼容 snake_case）。"""
+     urls: list[str] = []
+warning: in the working copy of 'video-downloader-v8\tests\test_core.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'video-downloader-v9\tests\test_core.py', LF will be replaced by CRLF the next time Git touches it
+--- "a/video-downloader-v8\\tests\\test_core.py"
++++ "b/video-downloader-v9\\tests\\test_core.py"
+@@ -18,7 +18,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ 
+ from core import jsonx, urls  # noqa: E402
+ from core.platform_base import PlatformBase  # noqa: E402
+-from core.platforms.bilibili import BilibiliPlatform, _urls_of  # noqa: E402
++from core.platforms.bilibili import (BilibiliPlatform, _urls_of,  # noqa: E402
++                                     parse_parts)
+ from core.platforms.douyin import DouyinPlatform, _image_key  # noqa: E402
+ 
+ 
+@@ -288,6 +289,42 @@ def test_bilibili_base_url():
+         "https://www.bilibili.com/video/av170001"
+ 
+ 
++def test_bilibili_parse_parts():
++    parse = parse_parts
++    assert parse("3-7") == [3, 4, 5, 6, 7]
++    assert parse("1,3,5") == [1, 3, 5]
++    assert parse("3-5,9") == [3, 4, 5, 9]
++    assert parse("  7  ") == [7]
++    assert parse("") == []                  # 空 = 不限制，下当前这一集
++    assert parse("1，3") == [1, 3]          # 中文逗号也认
++    assert parse("7-")[0] == 7              # 开区间：7 到上限
++    assert parse("abc") is None             # 无法解析 -> 界面报错
++    assert parse("5-3") is None
++    assert parse("0") is None
++
++
++def test_bilibili_select_pages():
++    pages = [{"page": 1, "part": "P1"}, {"page": 2, "part": "P2"},
++             {"page": 3, "part": "P3"}]
++    chosen, missing = BilibiliPlatform._select_pages(pages, [2, 3])
++    assert [p["page"] for p in chosen] == [2, 3]
++    assert missing == []
++
++    # 超出总集数的部分不算"缺失"，由调用方单独提示（避免 7- 刷屏）
++    chosen, missing = BilibiliPlatform._select_pages(pages, [2, 5])
++    assert [p["page"] for p in chosen] == [2]
++    assert missing == []
++
++    # 合集内部真缺一集（1、2、4，缺 3）才要报
++    gap = [{"page": 1}, {"page": 2}, {"page": 4}]
++    chosen, missing = BilibiliPlatform._select_pages(gap, [3])
++    assert chosen == [] and missing == [3]
++
++    # 勾了但没填集数 → 全部分P
++    chosen, missing = BilibiliPlatform._select_pages(pages, [])
++    assert chosen == pages and missing == []
++
++
+ def main() -> int:
+     tests = [(name, obj) for name, obj in sorted(globals().items())
+              if name.startswith("test_") and callable(obj)]
+warning: in the working copy of 'video-downloader-v8\README.md', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'video-downloader-v9\README.md', LF will be replaced by CRLF the next time Git touches it
+--- "a/video-downloader-v8\\README.md"
++++ "b/video-downloader-v9\\README.md"
+@@ -99,6 +99,21 @@ v6 之前必须先点「启动浏览器」才能拿到可编辑的输入框，
+ 合集下载按 `__INITIAL_STATE__.videoData.pages` 取分P列表，逐集解析 `__playinfo__`，
+ 失败只跳过该集并在日志里标注，最后给出 `成功/总数`。
+ 
++## v9 更新（按条指定分P范围）
++
++v8 只能"整部合集全下"，v9 改成按链接点名集数，并把范围写回 `p=`：
++
++| # | 改动 | 解决的问题 |
++| --- | --- | --- |
++| 1 | 勾选行右侧新增范围输入框，支持 `3-7` / `1,3,5` / `7-` | 只想要合集里几集时，不必整部下完再删 |
++| 2 | 范围按**每条链接**独立保存，默认只勾第一条 | 一次粘 10 条、其中 2 条要选集，可以分别指定 |
++| 3 | 空范围 = 该合集全部；非法写法在开始前弹窗拦下 | 静默变成"全下"或"下当前集"都会误导 |
++| 4 | 点名的分P不存在只提示并跳过 | 用户记错集数时，不该整条失败 |
++| 5 | 文件名前缀改用真实分P号（`03_标题.mp4`） | v8 用序号，`3-7` 会变成 `01..05` 对不上集数 |
++| 6 | 提示词随平台切换（B 站 / 抖音两套） | 切到 B 站后还显示"粘抖音分享文案" |
++
++平台差异：范围只对 Bilibili 生效；抖音没有分P概念，切到抖音时该区域自动隐藏。
++
+ ## 功能
+ 
+ - 批量下载：换行、空格、`|`、逗号、顿号分隔都行，分享文案直接粘
+@@ -142,14 +157,15 @@ python main.py
+ 4. 队列里实时显示进度、速度与结果
+ 5. **下载中想再加一批**：直接把新链接粘进输入框，按钮会变成「加入队列」，
+    点击后自动清空输入并排到当前批次之后，当前任务结束就接着下载
+-6. **Bilibili 合集 / 分P**：选 B 站后输入框下方会出现勾选列表，
+-   默认勾选第一条；勾了哪几条，就按链接里的 BV 号下载该合集的全部分P
++6. **Bilibili 分P（按条指定）**：选 B 站后输入框下方会列出每条链接，
++   勾选表示"这条要选集"，右侧填要哪几集（`3-7`、`1,3,5`、`7-`），
++   程序会把链接里的 `p=` 换成这些数字逐集下载；留空表示下载该合集全部分P
+ 7. 文件保存到：
+ 
+ | 内容 | 路径 |
+ | --- | --- |
+ | Bilibili 视频 | `<下载目录>/bili_video/` |
+-| Bilibili 合集 | `<下载目录>/bili_video/<标题>/01_分P标题.mp4 …` |
++| Bilibili 分P | `<下载目录>/bili_video/<标题>/03_分P标题.mp4 …`（前缀是分P号） |
+ | 抖音视频 | `<下载目录>/dy_video/` |
+ | 抖音图文 | `<下载目录>/dy_photo/<标题>/01.jpg …` |
+ 
+

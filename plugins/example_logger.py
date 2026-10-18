@@ -1,26 +1,37 @@
+"""示例插件：把下载历史写入 history.log。"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from pathlib import Path
+
+from core.models import DownloadResult
 from core.plugin_base import PluginBase
 
 
 class DownloadLogger(PluginBase):
-    """记录下载历史到日志文件的示例插件。"""
-
     name = "下载历史记录"
-    description = "将每次下载结果写入 history.log"
+    description = "把每次下载结果追加写入 history.log"
     author = "example"
-    version = "1.0"
+    version = "1.1"
 
     def on_init(self, browser):
-        from datetime import datetime
-        self._log_path = "history.log"
-        with open(self._log_path, "a", encoding="utf-8") as f:
-            f.write(f"\n[{datetime.now():%Y-%m-%d %H:%M:%S}] 插件已加载\n")
+        self._path = Path.cwd() / "history.log"
+        self._write("插件已加载")
 
-    def on_download_complete(self, url: str, video_path: str, success: bool):
-        from datetime import datetime
+    def on_download_complete(self, url: str, result: DownloadResult | None,
+                             success: bool) -> None:
         status = "成功" if success else "失败"
-        with open(self._log_path, "a", encoding="utf-8") as f:
-            f.write(f"[{datetime.now():%H:%M:%S}] {status} {url} -> {video_path}\n")
+        target = result.path if result else "-"
+        self._write(f"{status} {url} -> {target}")
 
-    def on_shutdown(self):
-        with open(self._log_path, "a", encoding="utf-8") as f:
-            f.write("插件已卸载\n")
+    def on_shutdown(self) -> None:
+        self._write("插件已卸载")
+
+    def _write(self, text: str) -> None:
+        path = getattr(self, "_path", Path.cwd() / "history.log")
+        try:
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {text}\n")
+        except OSError:
+            pass

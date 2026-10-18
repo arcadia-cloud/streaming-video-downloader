@@ -1,0 +1,76 @@
+﻿warning: in the working copy of 'C:\Users\Lenovo\AppData\Local\Temp\dsh-fEN1Uw\v10-before\app.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'D:\Users\Lenovo\Documents\deepseek-harness\default-workspace\video-downloader-v10\gui\app.py', LF will be replaced by CRLF the next time Git touches it
+--- "a/C:\\Users\\Lenovo\\AppData\\Local\\Temp\\dsh-fEN1Uw\\v10-before\\app.py"
++++ "b/D:\\Users\\Lenovo\\Documents\\deepseek-harness\\default-workspace\\video-downloader-v10\\gui\\app.py"
+@@ -369,6 +369,10 @@ class App(ctk.CTk):
+             self._status("没有有效链接", "warn")
+             return None
+ 
++        # 每次点击都按当前输入重新判定：先取消待执行的防抖重建，
++        # 否则刚改完链接就点击时，读到的还是上一轮的链接行
++        self.download_view.flush_parts()
++
+         urls = self._filter_plugins(self.browser.parse_urls(text))
+         if not urls:
+             messagebox.showwarning(
+@@ -409,6 +413,7 @@ class App(ctk.CTk):
+         ranges = self.download_view.get_parts_ranges()
+         bad: list[str] = []
+         built: list[tuple] = []
++        picked: list[str] = []
+         for platform, url in tasks:
+             options: dict = {}
+             if platform.name == "bilibili" and url in ranges:
+@@ -417,9 +422,12 @@ class App(ctk.CTk):
+                     bad.append(f"{url[:48]} → “{ranges[url]}”")
+                     continue
+                 options = {"collect": True, "parts": parsed}
++                picked.append(f"{url.rsplit('/video/', 1)[-1][:14]} → "
++                              f"{ranges[url] or '全部'}")
+             built.append((platform, url, options))
+ 
+         if bad:
++            self._status("集数范围有误", "warn")
+             messagebox.showwarning(
+                 "集数范围无法解析",
+                 "下面这些链接的集数范围看不懂：\n\n"
+@@ -429,6 +437,10 @@ class App(ctk.CTk):
+             )
+             return None
+ 
++        # 把本次判定结果写进日志：改完之后到底按什么值在跑，一眼能看到
++        if picked:
++            self._log(f"按集数下载 {len(picked)} 条：" + "；".join(picked[:3]))
++
+         return built
+ 
+     def _confirm_platform(self, tasks: list[tuple]) -> bool:
+warning: in the working copy of 'C:\Users\Lenovo\AppData\Local\Temp\dsh-fEN1Uw\v10-before\download_view.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'D:\Users\Lenovo\Documents\deepseek-harness\default-workspace\video-downloader-v10\gui\views\download_view.py', LF will be replaced by CRLF the next time Git touches it
+--- "a/C:\\Users\\Lenovo\\AppData\\Local\\Temp\\dsh-fEN1Uw\\v10-before\\download_view.py"
++++ "b/D:\\Users\\Lenovo\\Documents\\deepseek-harness\\default-workspace\\video-downloader-v10\\gui\\views\\download_view.py"
+@@ -501,6 +501,23 @@ class DownloadView(ctk.CTkFrame):
+     # ------------------------------------------------------------------
+     # 合集 / 分P
+     # ------------------------------------------------------------------
++    def flush_parts(self) -> None:
++        """取消待执行的防抖重建，立刻按当前输入重建一次。
++
++        每次点击「开始下载 / 加入队列」前都要调它：否则用户刚改完链接就点击，
++        350ms 的防抖还没跑，拿到的还是上一轮的链接行。
++        """
++        if self._parts_timer is not None:
++            try:
++                self.after_cancel(self._parts_timer)
++            except Exception:  # noqa: BLE001
++                pass
++            self._parts_timer = None
++
++        text = "" if self._placeholder_on else self.textbox.get("1.0", "end-1c")
++        urls = self.app.browser.parse_urls(text) if text.strip() else []
++        self.refresh_parts(urls)
++
+     def _schedule_parts(self, urls: list[str]) -> None:
+         """输入停顿 350ms 再重建，避免每敲一个字符就重排控件。"""
+         if self._parts_timer is not None:
+

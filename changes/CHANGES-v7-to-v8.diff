@@ -1,0 +1,1047 @@
+﻿warning: in the working copy of 'video-downloader-v7\gui\app.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'video-downloader-v8\gui\app.py', LF will be replaced by CRLF the next time Git touches it
+--- "a/video-downloader-v7\\gui\\app.py"
++++ "b/video-downloader-v8\\gui\\app.py"
+@@ -13,6 +13,7 @@ import queue
+ import re
+ import threading
+ import time
++from tkinter import messagebox
+ 
+ import customtkinter as ctk
+ 
+@@ -49,6 +50,9 @@ class App(ctk.CTk):
+         self._state = "idle"
+         self._closed = False
+         self._view = "download"
++        self._queue: list[tuple] = []
++        self._queue_lock = threading.Lock()
++        self._worker_active = False
+ 
+         self.browser = BrowserManager()
+         self.plugins: list = []
+@@ -253,6 +257,8 @@ class App(ctk.CTk):
+             self.download_view.set_state(payload)
+         elif kind == "queue":
+             self.download_view.set_queue(payload)
++        elif kind == "queue_append":
++            self.download_view.append_queue(payload)
+         elif kind == "item":
+             self.download_view.update_item(payload["index"], payload["state"],
+                                            payload.get("note", ""))
+@@ -263,6 +269,12 @@ class App(ctk.CTk):
+             self.download_view.set_stats(payload["ok"], payload["fail"])
+         elif kind == "progress":
+             self.download_view.set_progress(payload)
++        elif kind == "dialog":
++            try:
++                messagebox.showwarning(payload.get("title", "提示"),
++                                       payload.get("text", ""), parent=self)
++            except Exception:  # noqa: BLE001 - 弹窗失败不应影响主流程
++                pass
+ 
+     def _log(self, text: str, level: str = "info") -> None:
+         self.emit("log", {"text": text, "level": level})
+@@ -324,7 +336,9 @@ class App(ctk.CTk):
+ 
+         self._log("登录成功，开始下载", "success")
+         self._set_state("ready")
+-        self._begin_download(tasks)
++        # 登录页留着只会让窗口越来越乱；关掉多余标签，只留一个空白页
++        self.browser.reset_tabs()
++        self._begin_download(tasks, reset=True)
+ 
+     def _tick_login(self, seconds: int) -> None:
+         self._status(f"等待登录 · {seconds}s", "accent")
+@@ -346,33 +360,90 @@ class App(ctk.CTk):
+     # ------------------------------------------------------------------
+     # 下载
+     # ------------------------------------------------------------------
+-    def start_download(self) -> None:
+-        if self._state == "downloading":
+-            return
+-
++    def _collect_tasks(self) -> list[tuple] | None:
++        """解析输入框 + 来源校验，返回 (platform, url, options)。"""
+         text = self.download_view.get_text()
++        if not text.strip():
++            self._log("输入框是空的：先粘贴链接或分享文案", "warn")
++            self._status("没有有效链接", "warn")
++            return None
++
+         urls = self._filter_plugins(self.browser.parse_urls(text))
+         if not urls:
+-            self._log("没有识别到链接：可以直接粘贴分享文案，多条之间用换行或空格分开",
+-                      "warn")
+-            self._status("没有有效链接", "warn")
+-            return
++            messagebox.showwarning(
++                "没有识别到链接",
++                "输入框里没有可识别的视频链接。\n\n"
++                "可以直接粘贴分享文案，多条链接用换行或空格分开。",
++                parent=self,
++            )
++            self._log("没有识别到链接：可以直接粘贴分享文案", "warn")
++            return None
+ 
+         self._report_parsing(text, urls)
+ 
+-        tasks = []
++        tasks: list[tuple] = []
++        unrouted: list[str] = []
+         for url in urls:
+             platform = self.browser.get_platform_for_url(url)
+-            if platform is not None:
+-                tasks.append((platform, url))
++            if platform is None:
++                unrouted.append(url)
++                continue
++            tasks.append((platform, url))
++
++        if unrouted and not tasks:
++            messagebox.showwarning(
++                "链接不属于已支持的平台",
++                "识别到了链接，但没有一条属于 Bilibili 或 抖音：\n\n"
++                + "\n".join(item[:78] for item in unrouted[:3]),
++                parent=self,
++            )
++            return None
++        if unrouted:
++            self._log(f"{len(unrouted)} 条链接不属于已支持平台，已跳过", "warn")
++
++        if not self._confirm_platform(tasks):
++            return None
++
++        selected = self.download_view.get_parts_selection()
++        return [
++            (platform, url,
++             {"collect": platform.name == "bilibili" and url in selected})
++            for platform, url in tasks
++        ]
++
++    def _confirm_platform(self, tasks: list[tuple]) -> bool:
++        """链接平台与当前选择不一致时先问一句，避免"选错平台"白跑一趟。"""
++        current = self.browser.platform
++        others: dict[str, int] = {}
++        for platform, _url in tasks:
++            if platform is not current:
++                others[platform.display_name] = (
++                    others.get(platform.display_name, 0) + 1)
++        if not others:
++            return True
++
++        detail = "、".join(f"{name} {count} 条" for name, count in others.items())
++        return messagebox.askokcancel(
++            "平台可能选错了",
++            f"当前选择的是「{current.display_name}」，但识别到 {detail} 链接。\n\n"
++            "程序会按每条链接自己的平台下载，但浏览器只在当前平台完成登录，"
++            "另一个平台可能取不到数据。\n\n"
++            "点「确定」继续，点「取消」返回修改。",
++            parent=self,
++        )
++
++    def start_download(self) -> None:
++        if self._state == "downloading" or self._worker_active:
++            return
++
++        tasks = self._collect_tasks()
+         if not tasks:
+-            self._log("链接无法路由到任何平台", "warn")
+             return
+ 
+         self._stop.clear()
+ 
+         if self._state == "ready" and self.browser.page is not None:
+-            self._begin_download(tasks)
++            self._begin_download(tasks, reset=True)
+             return
+ 
+         self._set_state("launching")
+@@ -382,16 +453,40 @@ class App(ctk.CTk):
+         threading.Thread(target=self._login_then_download, args=(tasks,),
+                          daemon=True).start()
+ 
+-    def _begin_download(self, tasks: list) -> None:
++    def enqueue_download(self) -> None:
++        """下载中点了「加入队列」：清空输入，追加到当前批次之后。"""
++        if not self._worker_active:
++            self.start_download()
++            return
++
++        tasks = self._collect_tasks()
++        if not tasks:
++            return
++
++        self.download_view.clear_input()
++        self._begin_download(tasks, reset=False)
++
++    def _begin_download(self, tasks: list, reset: bool = True) -> None:
++        if reset or not self._queue:
++            with self._queue_lock:
++                self._queue = list(tasks)
++            self.emit("queue", list(tasks))
++            self.emit("stats", {"ok": 0, "fail": 0})
++            self.emit("progress", 0.0)
++        else:
++            with self._queue_lock:
++                self._queue.extend(tasks)
++            self.emit("queue_append", tasks)
++
++        with self._queue_lock:
++            total = len(self._queue)
+         self._set_state("downloading")
+         self._status("准备下载", "accent")
+-        self.emit("queue", tasks)
+-        self.emit("stats", {"ok": 0, "fail": 0})
+-        self.emit("progress", 0.0)
+-        self._log(f"共 {len(tasks)} 条链接，开始下载", "info")
++        self._log(f"待下载 {total} 条")
+ 
+-        threading.Thread(target=self._download_worker, args=(tasks,),
+-                         daemon=True).start()
++        if not self._worker_active:
++            self._worker_active = True
++            threading.Thread(target=self._run_queue, daemon=True).start()
+ 
+     def _report_parsing(self, text: str, urls: list[str]) -> None:
+         counts = {}
+@@ -429,69 +524,92 @@ class App(ctk.CTk):
+ 
+         return report
+ 
+-    def _download_worker(self, tasks: list) -> None:
+-        total = len(tasks)
++    def _run_queue(self) -> None:
++        """跑队列：每轮重新看长度，所以中途加入的任务会被接着执行。"""
+         success = fail = 0
++        errors: list[str] = []
++        index = 0
++        try:
++            while True:
++                with self._queue_lock:
++                    if index >= len(self._queue):
++                        break
++                    platform, url, options = self._queue[index]
++                    total = len(self._queue)
++
++                if self._stop.is_set():
++                    self.emit("item", {"index": index, "state": "skipped"})
++                    index += 1
++                    continue
+ 
+-        for index, (platform, url) in enumerate(tasks):
+-            if self._stop.is_set():
+-                self.emit("item", {"index": index, "state": "skipped"})
+-                continue
+-
+-            self.emit("item", {"index": index, "state": "running"})
+-            self._status(f"下载中 {index + 1}/{total}", "accent")
+-            self._log(f"[{index + 1}/{total}] {platform.display_name} · {url}")
+-
+-            for plugin in self.plugins:
+-                try:
+-                    plugin.on_download_start(url)
+-                except Exception:  # noqa: BLE001
+-                    pass
++                self.emit("item", {"index": index, "state": "running"})
++                self._status(f"下载中 {index + 1}/{total}", "accent")
++                self._log(f"[{index + 1}/{total}] {platform.display_name} · {url}")
+ 
+-            result = None
+-            tab = None
+-            started = time.monotonic()
+-            try:
+-                # 每个任务一个干净标签页：避免上一条的 SPA 状态、HTTP 缓存
+-                # 和监听残留串到这一条
+-                tab = self.browser.new_tab()
+-                headers = self.browser.headers(tab, url)
+-                result = platform.download(
+-                    tab, url, headers, f"video_{index + 1}",
+-                    on_progress=self._progress_reporter(index),
+-                    on_log=self._log,
+-                )
+-                success += 1
+-                detail = result.describe()
+-                if result.extra.get("quality"):
+-                    detail += f" · {result.extra['quality']}"
+-                if result.extra.get("watermarked"):
+-                    detail += " · 含平台水印"
+-                self.emit("item", {"index": index, "state": "success"})
+-                self._log(f"完成：{detail}（{time.monotonic() - started:.1f}s）",
+-                          "success")
+-            except Exception as exc:  # noqa: BLE001
+-                fail += 1
+-                self.emit("item", {"index": index, "state": "failed",
+-                                   "note": str(exc)[:80]})
+-                self._log(
+-                    f"失败：{exc}（{time.monotonic() - started:.1f}s）", "error")
+-            finally:
+-                if tab is not None:
++                for plugin in self.plugins:
+                     try:
+-                        tab.close()
++                        plugin.on_download_start(url)
+                     except Exception:  # noqa: BLE001
+                         pass
+ 
+-            for plugin in self.plugins:
++                result = None
++                tab = None
++                started = time.monotonic()
+                 try:
+-                    plugin.on_download_complete(url, result, result is not None)
+-                except Exception:  # noqa: BLE001
+-                    pass
+-
+-            self.emit("stats", {"ok": success, "fail": fail})
+-            self.emit("progress", (index + 1) / total)
++                    # 每个任务一个干净标签页：避免上一条的 SPA 状态、HTTP 缓存
++                    # 和监听残留串到这一条
++                    tab = self.browser.new_tab()
++                    headers = self.browser.headers(tab, url)
++                    result = platform.download(
++                        tab, url, headers, f"video_{index + 1}",
++                        on_progress=self._progress_reporter(index),
++                        on_log=self._log,
++                        options=options,
++                    )
++                    success += 1
++                    detail = result.describe()
++                    if result.extra.get("quality"):
++                        detail += f" · {result.extra['quality']}"
++                    if result.extra.get("watermarked"):
++                        detail += " · 含平台水印"
++                    self.emit("item", {"index": index, "state": "success"})
++                    self._log(
++                        f"完成：{detail}（{time.monotonic() - started:.1f}s）",
++                        "success")
++                except Exception as exc:  # noqa: BLE001
++                    fail += 1
++                    errors.append(f"{url[:48]} → {exc}")
++                    self.emit("item", {"index": index, "state": "failed",
++                                       "note": str(exc)[:80]})
++                    self._log(
++                        f"失败：{exc}（{time.monotonic() - started:.1f}s）",
++                        "error")
++                finally:
++                    if tab is not None:
++                        try:
++                            tab.close()
++                        except Exception:  # noqa: BLE001
++                            pass
++
++                for plugin in self.plugins:
++                    try:
++                        plugin.on_download_complete(url, result, result is not None)
++                    except Exception:  # noqa: BLE001
++                        pass
+ 
++                self.emit("stats", {"ok": success, "fail": fail})
++                index += 1
++                with self._queue_lock:
++                    total = max(len(self._queue), 1)
++                self.emit("progress", index / total)
++        finally:
++            self._worker_active = False
++            with self._queue_lock:
++                self._queue = []
++            self._finish_batch(success, fail, errors)
++
++    def _finish_batch(self, success: int, fail: int,
++                      errors: list[str]) -> None:
+         stopped = self._stop.is_set()
+         summary = f"全部结束：成功 {success} · 失败 {fail}"
+         self._log(summary + ("（已停止）" if stopped else ""),
+@@ -501,12 +619,22 @@ class App(ctk.CTk):
+             self.open_download_dir()
+ 
+         if self.browser.page is not None:
++            self.browser.reset_tabs()
+             self._status("已登录", "success")
+             self._set_state("ready")
+         else:
+             self._status("未连接", "neutral")
+             self._set_state("idle")
+ 
++        if fail and errors and not stopped:
++            self.emit("dialog", {
++                "title": "部分链接下载失败",
++                "text": (f"共 {fail} 条失败：\n\n"
++                         + "\n".join(errors[:4])
++                         + "\n\n常见原因：平台选错、链接失效、登录态过期、"
++                           "合集勾选与链接不匹配。"),
++            })
++
+     def _filter_plugins(self, urls: list[str]) -> list[str]:
+         result: list[str] = []
+         for url in urls:
+warning: in the working copy of 'video-downloader-v7\gui\views\download_view.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'video-downloader-v8\gui\views\download_view.py', LF will be replaced by CRLF the next time Git touches it
+--- "a/video-downloader-v7\\gui\\views\\download_view.py"
++++ "b/video-downloader-v8\\gui\\views\\download_view.py"
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ from datetime import datetime
++import tkinter as tk
+ 
+ import customtkinter as ctk
+ 
+@@ -26,6 +27,10 @@ class DownloadView(ctk.CTkFrame):
+         self._placeholder_on = False
+         self._input_enabled = False
+         self._log_visible = False
++        self._platform_name = PLATFORMS[0].name if PLATFORMS else ""
++        self._parts_signature: tuple[str, ...] = ()
++        self._parts_checked: set[str] = set()
++        self._parts_timer = None
+ 
+         self._build_footer()
+         self._build_composer()
+@@ -78,6 +83,25 @@ class DownloadView(ctk.CTkFrame):
+             justify="left", anchor="w",
+         ).pack(fill="x", pady=(2, 0))
+ 
++        # 合集 / 分P：只对 Bilibili 生效，按链接逐条勾选
++        self.parts_frame = ctk.CTkFrame(body, fg_color="transparent")
++        head = ctk.CTkFrame(self.parts_frame, fg_color="transparent")
++        head.pack(fill="x")
++        ctk.CTkLabel(
++            head, text="合集 / 分P（仅 Bilibili）", font=FONTS["tiny"],
++            text_color=COLORS["text_dim"],
++        ).pack(side="left")
++        ctk.CTkLabel(
++            head, text="勾选的链接会下载全部分P，默认第一条",
++            font=FONTS["tiny"], text_color=COLORS["text_faint"],
++        ).pack(side="left", padx=(8, 0))
++        self.parts_host = ctk.CTkScrollableFrame(
++            self.parts_frame, height=84, fg_color=COLORS["surface_2"],
++            corner_radius=RADIUS["inner"],
++            scrollbar_button_color=COLORS["surface_3"],
++        )
++        self.parts_host.pack(fill="x", pady=(6, 0))
++
+         bottom = ctk.CTkFrame(body, fg_color="transparent")
+         bottom.pack(fill="x", pady=(12, 0))
+ 
+@@ -205,10 +229,15 @@ class DownloadView(ctk.CTkFrame):
+             self.platform_seg.set_enabled(True)
+             self.stop_btn.configure(state="disabled")
+         elif state == "downloading":
+-            self._set_action("下载中…", False)
+-            self._set_input_enabled(False)
++            # 允许边下边粘下一批：按钮会在有内容时变成「加入队列」
++            self._set_input_enabled(True)
+             self.platform_seg.set_enabled(False)
+             self.stop_btn.configure(state="normal")
++            self._sync_action()
++
++        # 启动/登录/下载期间禁用「清空」，避免误清掉正在排队的链接
++        self.clear_btn.configure(
++            state="normal" if state in ("idle", "ready") else "disabled")
+ 
+     def refresh_theme(self) -> None:
+         """Tk 原生文本标签不吃元组颜色，换肤后手动刷一遍。"""
+@@ -223,6 +252,13 @@ class DownloadView(ctk.CTkFrame):
+         self.action_btn.configure(
+             text=text, state="normal" if enabled else "disabled")
+ 
++    def _sync_action(self) -> None:
++        """下载中：有内容就允许「加入队列」，没有就显示进度文案。"""
++        if self._state != "downloading":
++            return
++        has_text = not self._is_empty()
++        self._set_action("加入队列" if has_text else "下载中…", has_text)
++
+     def _set_input_enabled(self, enabled: bool) -> None:
+         self._input_enabled = enabled
+         self.textbox.configure(state="normal" if enabled else "disabled")
+@@ -241,7 +277,7 @@ class DownloadView(ctk.CTkFrame):
+         self.rows.clear()
+         self.empty.pack_forget()
+ 
+-        for index, (platform, url) in enumerate(tasks, 1):
++        for index, (platform, url, *_rest) in enumerate(tasks, 1):
+             row = QueueRow(self.scroll, index, url, platform)
+             row.pack(fill="x", pady=(0, 8))
+             self.rows.append(row)
+@@ -253,6 +289,27 @@ class DownloadView(ctk.CTkFrame):
+             self._sync_meta()
+         self._sync_empty()
+ 
++    def append_queue(self, tasks: list) -> None:
++        """新一批任务接在现有列表后面，索引继续往下排。"""
++        if self._log_visible:
++            self.toggle_log(False)
++        base = len(self.rows)
++        for offset, (platform, url, *_rest) in enumerate(tasks, 1):
++            row = QueueRow(self.scroll, base + offset, url, platform)
++            row.pack(fill="x", pady=(0, 8))
++            self.rows.append(row)
++        self.empty.pack_forget()
++        self._sync_meta()
++        self._sync_empty()
++
++    def clear_input(self) -> None:
++        """清空输入框并回到占位状态，但保持可编辑。"""
++        self.textbox.delete("1.0", "end")
++        self._placeholder_on = False
++        self._show_placeholder()
++        if not self._input_enabled:
++            self.textbox.configure(state="disabled")
++
+     def update_item(self, index: int, state: str, note: str = "") -> None:
+         if 0 <= index < len(self.rows):
+             self.rows[index].set_state(state, note)
+@@ -379,11 +436,13 @@ class DownloadView(ctk.CTkFrame):
+ 
+     def _update_counter(self) -> None:
+         text = "" if self._placeholder_on else self.textbox.get("1.0", "end-1c")
+-        count = len(self.app.browser.parse_urls(text)) if text.strip() else 0
++        urls = self.app.browser.parse_urls(text) if text.strip() else []
+         self.counter.configure(
+-            text=f"{count} 条" if count else "",
+-            text_color=COLORS["accent"] if count else COLORS["text_faint"],
++            text=f"{len(urls)} 条" if urls else "",
++            text_color=COLORS["accent"] if urls else COLORS["text_faint"],
+         )
++        self._schedule_parts(urls)
++        self._sync_action()
+ 
+     # ------------------------------------------------------------------
+     # 交互
+@@ -392,7 +451,11 @@ class DownloadView(ctk.CTkFrame):
+         self._on_action()
+ 
+     def _on_action(self) -> None:
+-        # 一个按钮走完全程：未登录时自动开浏览器，登录后自动开始下载
++        # 一个按钮走完全程：未登录自动开浏览器；下载中则加入队列
++        if self._state == "downloading":
++            if not self._is_empty():
++                self.app.enqueue_download()
++            return
+         if self._state in ("idle", "ready"):
+             self.app.start_download()
+ 
+@@ -409,4 +472,67 @@ class DownloadView(ctk.CTkFrame):
+         self.stop_btn.configure(state="disabled")
+ 
+     def _on_platform_change(self, name: str) -> None:
++        self._platform_name = name
++        text = "" if self._placeholder_on else self.textbox.get("1.0", "end-1c")
++        urls = self.app.browser.parse_urls(text) if text.strip() else []
++        self.refresh_parts(urls, force=True)
+         self.app.set_platform(name)
++
++    # ------------------------------------------------------------------
++    # 合集 / 分P
++    # ------------------------------------------------------------------
++    def _schedule_parts(self, urls: list[str]) -> None:
++        """输入停顿 350ms 再重建，避免每敲一个字符就重排控件。"""
++        if self._parts_timer is not None:
++            try:
++                self.after_cancel(self._parts_timer)
++            except Exception:  # noqa: BLE001
++                pass
++        self._parts_timer = self.after(350, lambda: self.refresh_parts(urls))
++
++    def refresh_parts(self, urls: list[str], force: bool = False) -> None:
++        self._parts_timer = None
++        if self._platform_name != "bilibili":
++            urls = []
++        signature = tuple(urls)
++        if signature == self._parts_signature and not force:
++            return
++        self._parts_signature = signature
++
++        for child in self.parts_host.winfo_children():
++            child.destroy()
++        self._parts_checked &= set(urls)
++
++        if not urls:
++            self.parts_frame.pack_forget()
++            return
++        if not self._parts_checked:
++            self._parts_checked.add(urls[0])      # 默认第一条
++
++        for index, url in enumerate(urls, 1):
++            var = tk.BooleanVar(value=url in self._parts_checked)
++            ctk.CTkCheckBox(
++                self.parts_host, text=f"{index}. {_shorten_url(url)}",
++                variable=var, font=FONTS["tiny"],
++                text_color=COLORS["text_dim"], fg_color=COLORS["accent"],
++                checkbox_width=16, checkbox_height=16,
++                command=lambda u=url, v=var: self._toggle_part(u, v),
++            ).pack(anchor="w", padx=6, pady=2)
++        self.parts_frame.pack(fill="x", pady=(10, 0))
++
++    def _toggle_part(self, url: str, var) -> None:
++        if var.get():
++            self._parts_checked.add(url)
++        else:
++            self._parts_checked.discard(url)
++
++    def get_parts_selection(self) -> set[str]:
++        if self._platform_name != "bilibili":
++            return set()
++        return set(self._parts_checked)
++
++
++def _shorten_url(url: str, limit: int = 56) -> str:
++    """检查项里只显示去协议头、限定长度的链接。"""
++    text = (url or "").split("://", 1)[-1]
++    return text if len(text) <= limit else text[:limit - 1] + "…"
+warning: in the working copy of 'video-downloader-v7\core\platforms\bilibili.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'video-downloader-v8\core\platforms\bilibili.py', LF will be replaced by CRLF the next time Git touches it
+--- "a/video-downloader-v7\\core\\platforms\\bilibili.py"
++++ "b/video-downloader-v8\\core\\platforms\\bilibili.py"
+@@ -7,18 +7,26 @@
+ - 无音轨视频（只落视频文件，不调 ffmpeg）
+ - backupUrl 备用 CDN
+ - dash.audio / dolby.audio / flac.audio 三级回退
++
++v8 增加合集 / 分P：
++- 链接里的 `?p=N` 只决定从哪一集开始看，不代表整部合集；
++- `options={"collect": True}` 时读 `__INITIAL_STATE__.videoData.pages`，
++  按 P 逐集下载到 `<标题>/01_分P标题.mp4`；
++- 不是合集却勾了合集，只提示并回退到单集，不当作错误。
+ """
+ 
+ from __future__ import annotations
+ 
++import json
+ import re
+ import uuid
++from pathlib import Path
+ 
+ from core import jsonx
+ from core.http_client import download_file
+ from core.media import merge_audio_video, unique_file
+-from core.models import DownloadResult
+-from core.platform_base import PlatformBase, find_ele
++from core.models import DownloadResult, Progress
++from core.platform_base import PlatformBase, find_ele, make_logger
+ 
+ QUALITY_LABELS = {
+     127: "8K", 126: "杜比视界", 125: "HDR", 120: "4K",
+@@ -26,7 +34,10 @@ QUALITY_LABELS = {
+     74: "720P60", 64: "720P", 32: "480P", 16: "360P",
+ }
+ 
++MAX_PARTS = 100
++
+ _BARE_ID = re.compile(r"^(?:BV[0-9A-Za-z]{10}|av[0-9]{1,12})$", re.I)
++_VIDEO_ID = re.compile(r"/(BV[0-9A-Za-z]{10}|av\d+)")
+ 
+ 
+ class BilibiliPlatform(PlatformBase):
+@@ -94,15 +105,33 @@ class BilibiliPlatform(PlatformBase):
+     # --- 下载 ---------------------------------------------------------
+     def download(self, tab, url: str, headers: dict,
+                  fallback_name: str, on_progress=None,
+-                 on_log=None) -> DownloadResult:
+-        tab.get(url, timeout=20)
+-        try:
+-            tab.wait.doc_loaded(timeout=10)
+-        except Exception:  # noqa: BLE001
+-            pass
++                 on_log=None, options: dict | None = None) -> DownloadResult:
++        options = options or {}
++        log = make_logger(on_log)
+ 
++        self._open(tab, url)
+         name = self.get_video_name(tab) or self.sanitize_filename(fallback_name)
+-        play = self._playinfo(tab.html)
++
++        if options.get("collect"):
++            pages = self._pages(tab.html)
++            if len(pages) > 1:
++                return self._download_pages(tab, url, headers, name, pages,
++                                            on_progress, log)
++            log("该链接没有分P/合集，按单个视频处理", "warn")
++
++        path, quality, cid = self._save_one(
++            tab.html, headers, name, self.folder(), on_progress, log,
++        )
++        return DownloadResult(
++            name=name, kind="video", path=str(path), files=[str(path)],
++            extra={"quality": quality, "cid": cid},
++        )
++
++    # --- 单集 ---------------------------------------------------------
++    def _save_one(self, html: str, headers: dict, stem: str,
++                  folder: Path, on_progress, log):
++        """解析当前页的 DASH 并保存为 <folder>/<stem>.mp4。"""
++        play = self._playinfo(html)
+         dash = (play.get("data") or play).get("dash") or {}
+ 
+         video = self._pick_video(dash.get("video") or [])
+@@ -111,15 +140,15 @@ class BilibiliPlatform(PlatformBase):
+ 
+         video_urls = _urls_of(video)
+         audio = self._pick_audio(dash)
+-        quality = QUALITY_LABELS.get(video.get("id", 0), f"{video.get('height', '?')}P")
++        quality = QUALITY_LABELS.get(video.get("id", 0),
++                                     f"{video.get('height', '?')}P")
+ 
+-        folder = self.folder()
+         folder.mkdir(parents=True, exist_ok=True)
+-
+         token = uuid.uuid4().hex[:8]
+-        video_tmp = folder / f".{name}.{token}.m4s"
+-        audio_tmp = folder / f".{name}.{token}.audio.m4s"
+-        out = unique_file(folder / f"{name}.mp4")
++        safe_stem = self.sanitize_filename(stem)
++        video_tmp = folder / f".{safe_stem}.{token}.m4s"
++        audio_tmp = folder / f".{safe_stem}.{token}.audio.m4s"
++        out = unique_file(folder / f"{safe_stem}.mp4")
+ 
+         try:
+             download_file(video_urls[0], video_tmp, headers,
+@@ -137,11 +166,89 @@ class BilibiliPlatform(PlatformBase):
+             for tmp in (video_tmp, audio_tmp):
+                 tmp.unlink(missing_ok=True)
+ 
++        return out, quality, play.get("cid")
++
++    # --- 合集 / 分P ---------------------------------------------------
++    def _download_pages(self, tab, url: str, headers: dict, name: str,
++                        pages: list[dict], on_progress, log) -> DownloadResult:
++        base = self._base_url(url)
++        total = min(len(pages), MAX_PARTS)
++        if len(pages) > MAX_PARTS:
++            log(f"分P过多（{len(pages)}），只下载前 {MAX_PARTS} 集", "warn")
++
++        folder = self.folder() / self.sanitize_filename(name)
++        folder.mkdir(parents=True, exist_ok=True)
++
++        files: list[str] = []
++        failures: list[str] = []
++        for index, page in enumerate(pages[:total], 1):
++            number = page.get("page") or index
++            title = self.sanitize_filename(page.get("part") or f"P{number}")
++            stem = f"{index:02d}_{title}"
++            self._open(tab, f"{base}?p={number}")
++            try:
++                path, _quality, _cid = self._save_one(
++                    tab.html, headers, stem, folder, None, log,
++                )
++            except Exception as exc:  # noqa: BLE001 - 单集失败不放弃整部
++                failures.append(f"P{number} {title}: {exc}")
++                log(f"P{number} 失败：{exc}", "error")
++                continue
++            files.append(str(path))
++            if on_progress:
++                on_progress(Progress(done=index, total=total, unit="items"))
++
++        if not files:
++            raise ValueError("合集下载全部失败：" + "；".join(failures[:2]))
++
+         return DownloadResult(
+-            name=name, kind="video", path=str(out), files=[str(out)],
+-            extra={"quality": quality, "cid": play.get("cid")},
++            name=self.sanitize_filename(name), kind="video",
++            path=str(folder), files=files,
++            extra={"quality": f"{len(files)}/{total} P"},
+         )
+ 
++    @staticmethod
++    def _open(tab, url: str) -> None:
++        tab.get(url, timeout=25)
++        try:
++            tab.wait.doc_loaded(timeout=10)
++        except Exception:  # noqa: BLE001
++            pass
++
++    @staticmethod
++    def _pages(html: str) -> list[dict]:
++        state = BilibiliPlatform._initial_state(html)
++        video = (state or {}).get("videoData") or {}
++        pages = video.get("pages") or []
++        return [page for page in pages if isinstance(page, dict)]
++
++    @staticmethod
++    def _initial_state(html: str) -> dict | None:
++        """`__INITIAL_STATE__` 不是严格 JSON（含 undefined），先替换再解析。"""
++        index = (html or "").find("__INITIAL_STATE__")
++        if index < 0:
++            return None
++        brace = html.find("{", index)
++        if brace < 0:
++            return None
++        try:
++            end = jsonx.object_end(html, brace)
++        except ValueError:
++            return None
++        raw = html[brace:end + 1].replace(":undefined", ":null")
++        try:
++            data = json.loads(raw)
++        except ValueError:
++            return None
++        return data if isinstance(data, dict) else None
++
++    @staticmethod
++    def _base_url(url: str) -> str:
++        match = _VIDEO_ID.search(url or "")
++        if match:
++            return f"https://www.bilibili.com/video/{match.group(1)}"
++        return (url or "").split("?")[0]
++
+     # --- 解析 ---------------------------------------------------------
+     @staticmethod
+     def _playinfo(html: str) -> dict:
+warning: in the working copy of 'video-downloader-v7\core\platforms\douyin.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'video-downloader-v8\core\platforms\douyin.py', LF will be replaced by CRLF the next time Git touches it
+--- "a/video-downloader-v7\\core\\platforms\\douyin.py"
++++ "b/video-downloader-v8\\core\\platforms\\douyin.py"
+@@ -112,8 +112,8 @@ class DouyinPlatform(PlatformBase):
+ 
+     # --- 下载 ---------------------------------------------------------
+     def download(self, tab, url: str, headers: dict,
+-                 fallback_name: str, on_progress=None,
+-                 on_log=None) -> DownloadResult:
++                 fallback_name: str, on_progress=None, on_log=None,
++                 options=None) -> DownloadResult:
+         log = _logger(on_log)
+         aweme = self._fetch_detail(tab, url, log)
+         name = (self.get_video_name(tab)
+warning: in the working copy of 'video-downloader-v7\core\platform_base.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'video-downloader-v8\core\platform_base.py', LF will be replaced by CRLF the next time Git touches it
+--- "a/video-downloader-v7\\core\\platform_base.py"
++++ "b/video-downloader-v8\\core\\platform_base.py"
+@@ -81,12 +81,13 @@ class PlatformBase(ABC):
+     @abstractmethod
+     def download(self, tab, url: str, headers: dict,
+                  fallback_name: str, on_progress=None,
+-                 on_log=None) -> DownloadResult:
++                 on_log=None, options: dict | None = None) -> DownloadResult:
+         """执行下载，返回下载结果。
+ 
+         on_progress 接收 core.models.Progress，用于界面显示百分比/速度。
+         on_log(message, level="info") 接收诊断信息，用于把"断在哪一步"
+         暴露到界面日志；不传时应完全静默。
++        options 是平台特有开关（例如 Bilibili 的 {"collect": True}）。
+         """
+         ...
+ 
+@@ -147,3 +148,22 @@ def find_eles(tab, *selectors: str, timeout: float = 2) -> list:
+             return list(elements)
+     return []
+ 
++
++def make_logger(on_log):
++    """把 on_log 归一成 emit(message, level)，兼容只收一个参数的回调。"""
++    if on_log is None:
++        return lambda *_args, **_kwargs: None
++
++    def emit(message: str, level: str = "info") -> None:
++        try:
++            on_log(message, level)
++        except TypeError:
++            try:
++                on_log(message)
++            except Exception:  # noqa: BLE001
++                pass
++        except Exception:  # noqa: BLE001 - 日志不能影响下载
++            pass
++
++    return emit
++
+warning: in the working copy of 'video-downloader-v7\core\browser.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'video-downloader-v8\core\browser.py', LF will be replaced by CRLF the next time Git touches it
+--- "a/video-downloader-v7\\core\\browser.py"
++++ "b/video-downloader-v8\\core\\browser.py"
+@@ -45,6 +45,29 @@ class BrowserManager:
+         return None
+ 
+     # --- 启动 ---------------------------------------------------------
++    @staticmethod
++    def _configured_browser_path() -> str:
++        try:
++            from core import config as app_config
++
++            return str(app_config.load().get("browser_path") or "").strip()
++        except Exception:  # noqa: BLE001
++            return ""
++
++    def _launch_options(self):
++        """指定了 browser_path 时用它（例如 Edge），否则交给 DrissionPage 默认。"""
++        path = self._configured_browser_path()
++        if not path:
++            return None
++        try:
++            from DrissionPage import ChromiumOptions
++
++            options = ChromiumOptions()
++            options.set_browser_path(path)
++            return options
++        except Exception:  # noqa: BLE001 - 路径无效时退回默认浏览器
++            return None
++
+     def launch(self) -> None:
+         if self._platform is None:
+             raise BrowserError("没有可用的平台")
+@@ -60,7 +83,8 @@ class BrowserManager:
+             self.quit()
+ 
+         try:
+-            self._page = ChromiumPage()
++            options = self._launch_options()
++            self._page = ChromiumPage(options) if options else ChromiumPage()
+             self._page.get(self._platform.login_url())
+             try:
+                 self._page.wait.doc_loaded(timeout=25)
+@@ -105,6 +129,36 @@ class BrowserManager:
+             raise BrowserError("浏览器尚未启动")
+         return self._page.new_tab(background=False)
+ 
++    def reset_tabs(self) -> int:
++        """关掉多余标签页，只留一个空白页；返回关闭数量。
++
++        登录页/首页留着会让窗口越来越乱，而关闭整个浏览器又会丢登录态，
++        所以这里只清理标签页。
++        """
++        page = self._page
++        if page is None:
++            return 0
++
++        try:
++            tabs = page.get_tabs() or []
++        except Exception:  # noqa: BLE001
++            tabs = []
++
++        closed = 0
++        for tab in tabs[1:]:
++            try:
++                tab.close()
++                closed += 1
++            except Exception:  # noqa: BLE001
++                pass
++
++        target = tabs[0] if tabs else page
++        try:
++            target.get("about:blank")
++        except Exception:  # noqa: BLE001
++            pass
++        return closed
++
+     def headers(self, tab, referer: str) -> dict:
+         cookies = []
+         try:
+warning: in the working copy of 'video-downloader-v7\core\config.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'video-downloader-v8\core\config.py', LF will be replaced by CRLF the next time Git touches it
+--- "a/video-downloader-v7\\core\\config.py"
++++ "b/video-downloader-v8\\core\\config.py"
+@@ -19,6 +19,7 @@ DEFAULTS: dict = {
+     "download_dir": str(DEFAULT_DOWNLOAD_DIR),
+     "open_after_done": False,
+     "appearance": "dark",          # light | dark | system
++    "browser_path": "",            # 留空 = 用系统默认 Chrome；可指向 Edge 等
+ }
+ 
+ 
+warning: in the working copy of 'video-downloader-v7\tests\test_core.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'video-downloader-v8\tests\test_core.py', LF will be replaced by CRLF the next time Git touches it
+--- "a/video-downloader-v7\\tests\\test_core.py"
++++ "b/video-downloader-v8\\tests\\test_core.py"
+@@ -265,6 +265,29 @@ def test_bilibili_playinfo_parse():
+     assert play["data"]["dash"]["video"][0]["id"] == 80
+ 
+ 
++def test_bilibili_initial_state_pages():
++    # __INITIAL_STATE__ 不是严格 JSON：里面会有 undefined
++    html = ('<script>window.__INITIAL_STATE__={"videoData":{"pages":['
++            '{"page":1,"part":"第一集","cid":1},'
++            '{"page":2,"part":"第二集","cid":2}],"extra":undefined}};</script>')
++    pages = BilibiliPlatform._pages(html)
++    assert [p["page"] for p in pages] == [1, 2]
++    assert pages[1]["part"] == "第二集"
++
++    # 单集没有 pages 数组
++    assert BilibiliPlatform._pages('<script>window.__INITIAL_STATE__='
++                                  '{"videoData":{"pages":[]}};</script>') == []
++
++
++def test_bilibili_base_url():
++    base = BilibiliPlatform._base_url
++    assert base("https://www.bilibili.com/video/BV1eY4y1W7Gd/"
++                "?spm_id_from=333.788.videopod.episodes&p=7") == \
++        "https://www.bilibili.com/video/BV1eY4y1W7Gd"
++    assert base("https://www.bilibili.com/video/av170001?p=3") == \
++        "https://www.bilibili.com/video/av170001"
++
++
+ def main() -> int:
+     tests = [(name, obj) for name, obj in sorted(globals().items())
+              if name.startswith("test_") and callable(obj)]
+warning: in the working copy of 'video-downloader-v7\README.md', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'video-downloader-v8\README.md', LF will be replaced by CRLF the next time Git touches it
+--- "a/video-downloader-v7\\README.md"
++++ "b/video-downloader-v8\\README.md"
+@@ -82,6 +82,23 @@ v6 之前必须先点「启动浏览器」才能拿到可编辑的输入框，
+ `_is_empty()` 现在把"占位中"也算空，修掉了 `_set_input_enabled` 与
+ `_on_focus_out` 里"提示词存在但被当成有内容"的连锁问题。
+ 
++## v8 更新（队列续跑 / 合集 / 来源校验）
++
++| # | 改动 | 解决的问题 |
++| --- | --- | --- |
++| 1 | 队列改成"边跑边收"：下载中可继续粘贴，按钮变「加入队列」 | 原来下载中锁死输入，只能等这一批跑完 |
++| 2 | 加入队列后自动清空输入框 | 手动清空容易漏，下一条链接接不上 |
++| 3 | 粘贴来源校验：链接平台与当前选择不一致时弹窗确认 | 选错平台后整批失败，用户不知道原因 |
++| 4 | 一批结束有失败时弹窗汇总前 4 条原因 | 失败原因只躺在日志里，容易被忽略 |
++| 5 | Bilibili 合集 / 分P 多选：按链接勾选，默认第一条 | `?p=7` 只代表第 7 集，合集需要单独声明 |
++| 6 | 勾了合集但不是合集 → 提示并回退单集 | 误勾导致整条失败 |
++| 7 | 登录完成后关闭多余标签页，只留一个空白页 | 登录页和任务标签堆在一起很乱 |
++| 8 | 新增 `browser_path` 配置，可改用 Edge 等 Chromium | 默认只能走系统 Chrome |
++| 9 | `download(..., options=)` 增加平台选项通道 | 平台特有开关（合集）没地方传 |
++
++合集下载按 `__INITIAL_STATE__.videoData.pages` 取分P列表，逐集解析 `__playinfo__`，
++失败只跳过该集并在日志里标注，最后给出 `成功/总数`。
++
+ ## 功能
+ 
+ - 批量下载：换行、空格、`|`、逗号、顿号分隔都行，分享文案直接粘
+@@ -123,16 +140,40 @@ python main.py
+    - 未登录 → 自动打开 Chrome 并停在登录页，状态栏显示「等待登录 · 剩余秒数」，
+      登录成功后自动开始下载；登录期间可点「停止」取消，链接会保留
+ 4. 队列里实时显示进度、速度与结果
+-5. 文件保存到：
++5. **下载中想再加一批**：直接把新链接粘进输入框，按钮会变成「加入队列」，
++   点击后自动清空输入并排到当前批次之后，当前任务结束就接着下载
++6. **Bilibili 合集 / 分P**：选 B 站后输入框下方会出现勾选列表，
++   默认勾选第一条；勾了哪几条，就按链接里的 BV 号下载该合集的全部分P
++7. 文件保存到：
+ 
+ | 内容 | 路径 |
+ | --- | --- |
+ | Bilibili 视频 | `<下载目录>/bili_video/` |
++| Bilibili 合集 | `<下载目录>/bili_video/<标题>/01_分P标题.mp4 …` |
+ | 抖音视频 | `<下载目录>/dy_video/` |
+ | 抖音图文 | `<下载目录>/dy_photo/<标题>/01.jpg …` |
+ 
+ 下载目录与外观可在「设置」页修改；环境变量 `BILI_DOWNLOADER_DIR` 优先级更高。
+ 
++## 支持的浏览器
++
++底层是 DrissionPage，走 Chrome DevTools 协议，所以**只支持 Chromium 内核**：
++
++| 浏览器 | 支持 | 说明 |
++| --- | --- | --- |
++| Chrome | ✅ 默认 | 不配置直接用它 |
++| Edge | ✅ | 在配置里填 `browser_path`，登录态独立 |
++| 其他 Chromium（Brave / 360 等） | ✅ | 同上，需给绝对路径 |
++| Firefox / Safari | ❌ | 没有 CDP，DrissionPage 不支持 |
++
++配置文件 `%APPDATA%\VideoDownloader\config.json`：
++
++```json
++{ "browser_path": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe" }
++```
++
++留空即使用系统默认 Chrome；路径无效会自动退回默认。
++
+ ![设置页](docs/settings.png)
+ 
+ ## 项目结构
+

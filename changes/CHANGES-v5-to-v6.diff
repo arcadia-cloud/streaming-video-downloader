@@ -1,0 +1,493 @@
+﻿warning: in the working copy of 'video-downloader-v5\core\platforms\douyin.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'video-downloader-v6\core\platforms\douyin.py', LF will be replaced by CRLF the next time Git touches it
+--- "a/video-downloader-v5\\core\\platforms\\douyin.py"
++++ "b/video-downloader-v6\\core\\platforms\\douyin.py"
+@@ -1,27 +1,33 @@
+ """抖音平台实现：视频 / 图文自动识别。
+ 
+-v5 修正（相对 v4）——每一处都对应一个真实的失败模式：
+-
+-1. 详情包按 aweme_id 校验：不再"监听捡到第一个包就当成当前作品"，
+-   推荐流预取的相邻作品会被丢弃；
+-2. 图文优先读结构化字段（images / image_post_info.images / image_list），
+-   而不是先看顶层 images 就下结论；
+-3. 滑屏兜底改为"读已渲染的 DOM + 观察是否还在增长"，不再按总页数
+-   硬算滑动次数，也不再依赖"网络静默"这种不可靠信号；
+-4. 图片去重键改为"路径段"，不再把整条 URL 当 key（旧实现在没有
+-   ~tplv/~noop 的地址上会给同一张图建多个分组，再用 [:total] 截断）；
+-5. 不再用 max(numbers) 猜总页数，"999+" 这类文本不会再把页数放大；
+-6. download_addr 只在完全没有 play_addr 时兜底，并在结果里标记
+-   watermarked，避免静默存下带水印的分享版；
+-7. 全程 on_log 回调：失败时能看清断在"取包 / 字段 / 采集 / 下载"哪一步。
++v6 在 v5 的基础上继续收紧取数与容错（每一条都对应一类真实失败）：
++
++1. 短链跳转后重新取 aweme_id：`v.douyin.com/xxx` 打开前没有 id，
++   跳转完成后用最终 URL 再解析一次，避免短链场景退化成"捡第一个包"；
++2. 详情未命中时刷新重试一次：首屏偶发不发请求的情况不必人工重跑；
++3. 失败时给出页面状态：风控页 / 登录墙 / 作品已删除 / 纯客户端渲染，
++   而不是笼统的"页面解析也未命中"；
++4. 文件名优先取作品文案（desc），比页面标题元素更稳、更可读；
++5. 图片并发下载（默认 3 路），顺序仍按索引返回；
++   requests.Session 改为线程局部，规避连接池竞争；
++6. DOM 采集补 srcset 与 HTML 实体解码，减少"地址拿不到"的漏图；
++7. 图集字段额外兼容 download_url_list。
++
++v5 已修正（相对 v4）：
++- 详情包按 aweme_id 校验；图文字段三级回退；滑屏改读 DOM；
++- 去重键改为路径段、取消 [:total] 硬截断；页数只接受 1..30；
++- download_addr 降级为兜底并标记 watermarked；全程 on_log 诊断。
+ """
+ 
+ from __future__ import annotations
+ 
++import html
+ import json
+ import random
+ import re
++import threading
+ import time
++from concurrent.futures import ThreadPoolExecutor
+ from urllib.parse import unquote
+ 
+ from core import jsonx
+@@ -33,9 +39,9 @@ from core.platform_base import PlatformBase, find_ele, find_eles
+ DETAIL_API = "aweme/detail"
+ IMAGE_HOST = "https://p3-pc-sign.douyinpic.com/tos-cn-i"
+ SLIDE_DELAY = (0.18, 0.3)
+-IMAGE_DELAY = (0.2, 0.4)
+ MAX_PAGES = 30
+-DETAIL_WAIT_SECONDS = 20.0
++DETAIL_WAIT_SECONDS = 12.0
++IMAGE_WORKERS = 3
+ 
+ # 图文图片在 player-container 里以 <img> 或 background-image 出现
+ _CONTAINER = 'xpath://div[@data-e2e="player-container"]'
+@@ -48,6 +54,15 @@ _IMAGE_KEY = re.compile(r"/tos-cn-i[^/]*/([^~?]+)")
+ _URL_PATH = re.compile(r"/([^/?]+)(?:\?|$)")
+ _BG_URL = re.compile(r"""url\(["']?([^"')]+)["']?\)""")
+ 
++# 失败时的页面特征 -> 人话
++_PAGE_MARKERS = (
++    ("验证", "页面是风控/验证码页，需要人工过验证"),
++    ("captcha", "页面是风控/验证码页，需要人工过验证"),
++    ("扫码登录", "登录态已失效，页面停在登录入口"),
++    ("作品不存在", "作品不存在或已被删除"),
++    ("内容不可见", "作品不可见（私密 / 仅粉丝 / 地区限制）"),
++)
++
+ 
+ class DouyinPlatform(PlatformBase):
+     name = "douyin"
+@@ -85,13 +100,25 @@ class DouyinPlatform(PlatformBase):
+                     return self.sanitize_filename(text)
+         return None
+ 
++    def _name_from_aweme(self, aweme: dict) -> str | None:
++        """作品文案比页面标题元素更可靠，也更有辨识度。"""
++        for key in ("desc", "caption"):
++            text = (aweme.get(key) or "").strip()
++            if text:
++                cleaned = self.sanitize_filename(text)
++                if cleaned and cleaned != "untitled":
++                    return cleaned
++        return None
++
+     # --- 下载 ---------------------------------------------------------
+     def download(self, tab, url: str, headers: dict,
+                  fallback_name: str, on_progress=None,
+                  on_log=None) -> DownloadResult:
+         log = _logger(on_log)
+         aweme = self._fetch_detail(tab, url, log)
+-        name = self.get_video_name(tab) or self.sanitize_filename(fallback_name)
++        name = (self.get_video_name(tab)
++                or self._name_from_aweme(aweme)
++                or self.sanitize_filename(fallback_name))
+ 
+         video_urls, used_download_addr = self._video_urls(aweme)
+         if video_urls:
+@@ -129,32 +156,43 @@ class DouyinPlatform(PlatformBase):
+ 
+     # --- 数据获取 -----------------------------------------------------
+     def _fetch_detail(self, tab, url: str, log) -> dict:
+-        """监听详情接口，按 aweme_id 过滤，超时后再试页面解析。"""
++        """监听详情接口；未命中时刷新重试一次，再退到页面内嵌数据。"""
+         aweme_id = self._aweme_id(url)
+-        log(f"详情接口监听中（aweme_id={aweme_id or '未知，短链待跳转'}）")
+-
+         tab.listen.start(DETAIL_API)
+         try:
+-            try:
+-                tab.get(url, timeout=25)
+-            except Exception as exc:  # noqa: BLE001 - 导航超时仍可能有包
+-                log(f"打开页面失败：{type(exc).__name__}: {exc}", "error")
+-            detail = self._wait_detail(tab, aweme_id, log)
++            self._load(tab, url, log)
++            resolved = aweme_id or self._aweme_id(getattr(tab, "url", "") or "")
++            if resolved and not aweme_id:
++                log(f"短链跳转后解析到 aweme_id={resolved}")
++
++            detail = self._wait_detail(tab, resolved, log)
++            if detail is None:
++                log("首次未命中，刷新页面重试一次", "error")
++                self._load(tab, url, log, refresh=True)
++                detail = self._wait_detail(tab, resolved, log)
+         finally:
+             tab.listen.stop()
+ 
+         if detail:
+             return detail
+ 
+-        log("详情接口未拿到匹配的包，尝试页面内嵌数据", "error")
+-        detail = self._parse_html(tab.html)
+-        if detail:
+-            log("页面内嵌数据命中（字段可能比接口少）", "info")
+-            return detail
++        inline = self._inline_detail(tab.html)
++        if inline:
++            log("页面内嵌数据命中（字段可能比接口少）")
++            return inline
++
++        raise ValueError(f"拿不到作品数据：{self._page_state(tab)}")
+ 
+-        raise ValueError(
+-            "拿不到作品数据：接口监听 20s 内无匹配包，页面解析也未命中"
+-            "（常见原因：登录态失效、风控验证页、或该链接不是作品页）")
++    @staticmethod
++    def _load(tab, url: str, log, refresh: bool = False) -> None:
++        try:
++            if refresh:
++                tab.refresh()
++            else:
++                tab.get(url, timeout=25)
++        except Exception as exc:  # noqa: BLE001 - 导航超时仍可能有包
++            action = "刷新" if refresh else "打开"
++            log(f"{action}页面失败：{type(exc).__name__}: {exc}", "error")
+ 
+     def _wait_detail(self, tab, aweme_id: str | None, log) -> dict | None:
+         """在截止时间内持续收包，只接受 aweme_id 匹配的那一个。"""
+@@ -202,11 +240,11 @@ class DouyinPlatform(PlatformBase):
+         return None
+ 
+     @staticmethod
+-    def _parse_html(html: str) -> dict | None:
+-        # 1) 服务端渲染的 RENDER_DATA（URL 编码的 JSON）
++    def _inline_detail(html_text: str) -> dict | None:
++        """页面内嵌数据：能命中就用，命中不了交给 _page_state 解释。"""
+         match = re.search(
+             r'<script[^>]+id="RENDER_DATA"[^>]*>(.*?)</script>',
+-            html, re.S,
++            html_text or "", re.S,
+         )
+         if match:
+             try:
+@@ -217,12 +255,11 @@ class DouyinPlatform(PlatformBase):
+             except (ValueError, TypeError):
+                 pass
+ 
+-        # 2) 页面里直接出现的键：用括号配平截取完整对象
+         for marker in ('"aweme_detail":', '"awemeDetail":'):
+-            if marker not in html:
++            if marker not in (html_text or ""):
+                 continue
+             try:
+-                data = jsonx.json_after(html, marker)
++                data = jsonx.json_after(html_text, marker)
+             except (ValueError, json.JSONDecodeError):
+                 continue
+             if isinstance(data, dict):
+@@ -230,10 +267,26 @@ class DouyinPlatform(PlatformBase):
+                     data, ("aweme_detail", "awemeDetail")) or data
+         return None
+ 
++    @staticmethod
++    def _page_state(tab) -> str:
++        """把"拿不到"翻译成具体原因，避免统一报超时。"""
++        try:
++            html_text = tab.html or ""
++            current_url = getattr(tab, "url", "") or ""
++        except Exception:  # noqa: BLE001
++            return "读取页面内容失败（标签页可能已关闭）"
++
++        head = html_text[:200000]
++        for marker, reason in _PAGE_MARKERS:
++            if marker in head:
++                return reason
++        snippet = current_url[:80]
++        return f"页面没有作品结构（可能已改为纯客户端渲染），当前页 {snippet}"
++
+     @staticmethod
+     def _aweme_id(url: str) -> str | None:
+         """从作品链接里取 aweme_id；短链拿不到时返回 None。"""
+-        match = _MODAL_ID.search(url) or _AWEME_ID.search(url)
++        match = _MODAL_ID.search(url or "") or _AWEME_ID.search(url or "")
+         return match.group(1) if match else None
+ 
+     @staticmethod
+@@ -293,7 +346,10 @@ class DouyinPlatform(PlatformBase):
+         candidates: list[list[str]] = []
+         for image in images:
+             if isinstance(image, dict):
+-                candidates.append([u for u in (image.get("url_list") or []) if u])
++                urls: list[str] = []
++                for key in ("url_list", "download_url_list"):
++                    urls.extend(u for u in (image.get(key) or []) if u)
++                candidates.append(list(dict.fromkeys(urls)))
+             elif isinstance(image, str) and image:
+                 candidates.append([image])
+ 
+@@ -323,7 +379,7 @@ class DouyinPlatform(PlatformBase):
+             return added
+ 
+         try:
+-            tab.get(url, timeout=25)
++            self._load(tab, url, log)
+             total = self._wait_total(tab)
+             if not total:
+                 raise ValueError("无法识别图文总页数")
+@@ -362,13 +418,20 @@ class DouyinPlatform(PlatformBase):
+         """读取当前已渲染的图片地址：DOM 是事实，网络包只是线索。"""
+         found: list[str] = []
+         for element in find_eles(tab, _IMG_XPATH, timeout=0.5):
+-            src = (element.attr("src") or element.attr("data-src") or "").strip()
++            src = (element.attr("src") or "").strip()
++            if not src.startswith("http"):
++                src = (element.attr("data-src") or "").strip()
++            if not src.startswith("http"):
++                srcset = (element.attr("srcset") or "").split(",")[0].strip()
++                src = srcset.split(" ")[0] if srcset else ""
+             if src.startswith("http"):
+-                found.append(src)
++                found.append(html.unescape(src))
+         for element in find_eles(tab, _BG_XPATH, timeout=0.5):
+             match = _BG_URL.search(element.attr("style") or "")
+-            if match and match.group(1).startswith("http"):
+-                found.append(match.group(1))
++            if match:
++                candidate = html.unescape(match.group(1))
++                if candidate.startswith("http"):
++                    found.append(candidate)
+         return found
+ 
+     def _drag_once(self, tab) -> bool:
+@@ -397,31 +460,52 @@ class DouyinPlatform(PlatformBase):
+     def _save_images(self, candidates: list[list[str]], name: str,
+                      headers: dict, on_progress=None,
+                      log=None) -> DownloadResult:
++        """并发保存图片；返回的 files 始终按图片序号排列。"""
+         log = log or _logger(None)
+         folder = unique_dir(self.photo_folder() / name)
+         folder.mkdir(parents=True, exist_ok=True)
+ 
+         total = len(candidates)
+-        files: list[str] = []
+-        for index, urls in enumerate(candidates, 1):
+-            if on_progress:
+-                on_progress(Progress(done=index - 1, total=total, unit="items"))
+-            saved = False
++        saved: dict[int, str] = {}
++        lock = threading.Lock()
++        finished = 0
++
++        def report(done: int) -> None:
++            if on_progress is None:
++                return
++            try:
++                on_progress(Progress(done=done, total=total, unit="items"))
++            except Exception:  # noqa: BLE001 - 进度回调不能影响下载
++                pass
++
++        def work(index: int, urls: list[str]) -> None:
++            nonlocal finished
+             for candidate in _order_candidates(urls):
+                 try:
+-                    path = download_media(candidate, folder / f"{index:02d}",
+-                                          headers)
+-                    files.append(str(path))
+-                    saved = True
+-                    break
++                    path = download_media(candidate,
++                                          folder / f"{index:02d}", headers)
+                 except Exception as exc:  # noqa: BLE001 - 换下一个地址
+                     log(f"第 {index} 张候选取失败：{type(exc).__name__}")
+-            if not saved:
+-                log(f"第 {index} 张所有候选都失败，已跳过", "error")
+-            time.sleep(random.uniform(*IMAGE_DELAY))
+-
+-        if on_progress:
+-            on_progress(Progress(done=total, total=total, unit="items"))
++                    continue
++                with lock:
++                    saved[index] = str(path)
++                    finished += 1
++                    done = finished
++                report(done)
++                return
++
++            log(f"第 {index} 张所有候选都失败，已跳过", "error")
++            with lock:
++                finished += 1
++                done = finished
++            report(done)
++
++        report(0)
++        with ThreadPoolExecutor(max_workers=max(1, IMAGE_WORKERS)) as pool:
++            for index, urls in enumerate(candidates, 1):
++                pool.submit(work, index, urls)
++
++        files = [saved[index] for index in sorted(saved)]
+         if not files:
+             raise RuntimeError("所有图片下载均失败")
+         if len(files) < total:
+warning: in the working copy of 'video-downloader-v5\core\http_client.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'video-downloader-v6\core\http_client.py', LF will be replaced by CRLF the next time Git touches it
+--- "a/video-downloader-v5\\core\\http_client.py"
++++ "b/video-downloader-v6\\core\\http_client.py"
+@@ -9,6 +9,7 @@
+ 
+ from __future__ import annotations
+ 
++import threading
+ import time
+ from pathlib import Path
+ from typing import Iterable
+@@ -28,8 +29,21 @@ class HttpError(RuntimeError):
+     """网络请求失败（已重试）。"""
+ 
+ 
+-_session = requests.Session()
+-_session.headers.update({"Accept-Language": "zh-CN,zh;q=0.9"})
++_local = threading.local()
++
++
++def _session() -> requests.Session:
++    """每线程一个 Session：requests.Session 不保证线程安全。
++
++    图片改为并发下载后，共享连接池会出现偶发的读到错误响应；
++    线程局部 Session 让每个 worker 各用各的连接池。
++    """
++    session = getattr(_local, "session", None)
++    if session is None:
++        session = requests.Session()
++        session.headers.update({"Accept-Language": "zh-CN,zh;q=0.9"})
++        _local.session = session
++    return session
+ 
+ 
+ def _clean_headers(headers: dict | None) -> dict:
+@@ -42,7 +56,7 @@ def http_get(url: str, headers: dict | None = None, timeout: int = 15,
+     last: Exception | None = None
+     for attempt in range(retries + 1):
+         try:
+-            res = _session.get(url, headers=_clean_headers(headers),
++            res = _session().get(url, headers=_clean_headers(headers),
+                                timeout=(8, timeout))
+             res.raise_for_status()
+             return res
+@@ -90,7 +104,7 @@ def download_file(url: str, dest: str | Path, headers: dict | None = None,
+ 
+ def _stream_to(url: str, part: Path, headers: dict | None,
+                timeout: tuple[int, int], on_progress=None) -> None:
+-    with _session.get(url, headers=_clean_headers(headers), timeout=timeout,
++    with _session().get(url, headers=_clean_headers(headers), timeout=timeout,
+                       stream=True) as res:
+         res.raise_for_status()
+         expected = int(res.headers.get("Content-Length") or 0)
+@@ -139,7 +153,7 @@ def download_media(url: str, dest_stem: str | Path,
+     last: Exception | None = None
+     for attempt in range(retries + 1):
+         try:
+-            with _session.get(url, headers=_clean_headers(headers),
++            with _session().get(url, headers=_clean_headers(headers),
+                               timeout=(8, timeout), stream=True) as res:
+                 res.raise_for_status()
+                 ext = _ext_from_content_type(res.headers.get("Content-Type", ""))
+warning: in the working copy of 'video-downloader-v5\tests\test_core.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'video-downloader-v6\tests\test_core.py', LF will be replaced by CRLF the next time Git touches it
+--- "a/video-downloader-v5\\tests\\test_core.py"
++++ "b/video-downloader-v6\\tests\\test_core.py"
+@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ from core import jsonx, urls  # noqa: E402
+ from core.platform_base import PlatformBase  # noqa: E402
+ from core.platforms.bilibili import BilibiliPlatform, _urls_of  # noqa: E402
+-from core.platforms.douyin import DouyinPlatform  # noqa: E402
++from core.platforms.douyin import DouyinPlatform, _image_key  # noqa: E402
+ 
+ 
+ class FakePacket:
+@@ -27,6 +27,14 @@ class FakePacket:
+         self.url = url
+ 
+ 
++class FakeTab:
++    """只提供 _page_state 需要的两个属性。"""
++
++    def __init__(self, html_text: str = "", url: str = "https://www.douyin.com/"):
++        self.html = html_text
++        self.url = url
++
++
+ # ---------------------------------------------------------------- jsonx
+ def test_json_after_handles_nesting():
+     html = ('<script>window.__playinfo__='
+@@ -195,6 +203,32 @@ def test_douyin_video_prefers_play_addr():
+     assert urls == ["https://wm"] and watermarked is True
+ 
+ 
++def test_douyin_name_from_desc():
++    platform = DouyinPlatform()
++    assert platform._name_from_aweme(
++        {"desc": "  我的 作品 / 合集  "}) == "我的 作品 _ 合集"
++    assert platform._name_from_aweme({}) is None
++    assert platform._name_from_aweme({"desc": "   "}) is None
++
++
++def test_douyin_image_key_variants():
++    head = "https://p3-pc-sign.douyinpic.com/tos-cn-i-0813/"
++    assert _image_key(head + "oAAA~tplv-dy:q75.webp?b=1") == "oAAA"
++    assert _image_key(head + "oAAA~noop.webp?b=1") == "oAAA"
++    # 没有 ~tplv/~noop 时也不该把整条 URL 当 key
++    assert _image_key(
++        "https://p3-pc-sign.douyinpic.com/plain/oBBB.jpeg"
++    ) == "oBBB.jpeg"
++
++
++def test_douyin_page_state_reasons():
++    state = DouyinPlatform._page_state
++    assert "登录" in state(FakeTab("<div>扫码登录</div>"))
++    assert "风控" in state(FakeTab("<div>请完成验证</div>"))
++    assert "作品不存在" in state(FakeTab("<div>作品不存在</div>"))
++    assert "没有作品结构" in state(FakeTab("<html><body>x</body></html>", "https://a/b"))
++
++
+ # ---------------------------------------------------------------- bilibili
+ def test_bilibili_urls_include_backup():
+     item = {"baseUrl": "https://a", "backupUrl": ["https://b", "https://c"]}
+warning: in the working copy of 'video-downloader-v5\README.md', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'video-downloader-v6\README.md', LF will be replaced by CRLF the next time Git touches it
+--- "a/video-downloader-v5\\README.md"
++++ "b/video-downloader-v6\\README.md"
+@@ -47,6 +47,23 @@ v4 的抖音链路是"导航页面 → 监听接口 → 捡到哪个包用哪个
+ 新增 5 项纯逻辑测试（字段路径、aweme_id 提取、水印兜底、页数上限、去重稳定性），
+ `python tests/test_core.py` 共 23 项全通过。
+ 
++## v6 修正（容错、并发、可诊断）
++
++v5 解决了"取数方式"，v6 处理剩下的三类问题：短链/重试、失败原因不可读、图片串行太慢。
++
++| # | 改动 | 解决的问题 |
++| --- | --- | --- |
++| 1 | 短链跳转后用最终 URL 重新解析 `aweme_id` | `v.douyin.com/xxx` 打开前没有 id，短链场景会退化成"捡第一个包" |
++| 2 | 详情未命中时刷新重试一次（截止 12s × 2） | 首屏偶发不发请求，不必人工重跑 |
++| 3 | 失败时输出页面状态：风控页/登录墙/已删除/纯 CSR | 不再统一报"页面解析也未命中" |
++| 4 | 文件名优先取作品文案 `desc` | 页面标题元素经常拿不到，退化成 `video_1` |
++| 5 | 图片并发下载（3 路），`files` 仍按序号返回 | 9 张图串行约 9s，现在约 3-4s |
++| 6 | `requests.Session` 改为线程局部 | 并发共享连接池会出现偶发错误响应 |
++| 7 | DOM 采集补 `srcset`、HTML 实体解码 | `&amp;`、懒加载 `data-src` 导致的漏图 |
++| 8 | 图集字段兼容 `download_url_list` | 部分图集只有下载地址列表 |
++
++新增 3 项测试（文案命名、去重键变体、页面状态判定），共 26 项通过。
++
+ ## 功能
+ 
+ - 批量下载：换行、空格、`|`、逗号、顿号分隔都行，分享文案直接粘
+
