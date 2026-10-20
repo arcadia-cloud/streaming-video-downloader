@@ -1,8 +1,7 @@
-[Uploading README-new.md…]()
 # Video Downloader
 
-多平台视频 / 图文下载工具，桌面 GUI，基于 DrissionPage 驱动本机 Chrome。
-已支持 **Bilibili** 与 **抖音**，架构预留小红书等平台扩展。
+多平台视频 / 图文下载工具，桌面 GUI，基于 DrissionPage 驱动本机浏览器。
+已支持 **Bilibili**、**抖音**、**小红书**（图文笔记）。
 
 | 深色 | 浅色 |
 | --- | --- |
@@ -79,6 +78,7 @@ run.bat
 | Bilibili 分P | `bili_video/<标题>/18_分P标题.mp4` |
 | 抖音视频 | `dy_video/` |
 | 抖音图文 | `dy_photo/<标题>/01.jpg …` |
+| 小红书图文 | `xhs_photo/<标题>/01.webp …` |
 
 设置页可以改成别的目录。
 
@@ -94,6 +94,10 @@ run.bat
   - 自动区分视频与图文，不用手动选
   - 支持直接粘贴分享文案（`7.68 复制打开抖音…`）
   - 图文按张下载，文件名带序号
+- **小红书**
+  - 分享文案、分享短链（`xhslink.com` / `xhslink.cn`）、网页链接都能粘，混着也行
+  - 自动读页面右下角的 `1/8` 页码，按张数采集，不会多抓推荐位的图
+  - 图片按顺序命名，4~8 路并发下载
 - **通用**
   - 一次粘贴多条链接；下载中还能继续粘贴 → 「加入队列」
   - 开始下载后自动清空输入框，方便粘下一批
@@ -157,7 +161,7 @@ core/
   platforms/
     bilibili.py         Bilibili 实现
     douyin.py           抖音实现
-    xiaohongshu.py      小红书（预留）
+    xiaohongshu.py      小红书（图文笔记，DOM 解析）
 gui/
   app.py                应用主体、队列调度
   views/                下载页 / 设置页 / 关于页
@@ -176,7 +180,7 @@ changes/                v4→v10 每一步的 diff
 | 键 | 说明 |
 | --- | --- |
 | `download_dir` | 下载目录 |
-| `browser_path` | Chrome/Edge 路径，留空用系统默认 |
+| `browser_path` | 浏览器路径，留空自动优先用 Edge |
 | `appearance` | `light` / `dark` / `system` |
 | `open_after_done` | 下载完是否打开目录 |
 

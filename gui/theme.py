@@ -46,6 +46,7 @@ COLORS: dict[str, Pair] = {
     # 平台色
     "bilibili": _pair("#D64280", "#FF86AE"),
     "douyin": _pair("#0B8F88", "#5EEAD4"),
+    "xiaohongshu": _pair("#D92B3F", "#FF7A8A"),
 }
 
 FAMILY = "Microsoft YaHei UI"

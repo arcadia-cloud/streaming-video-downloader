@@ -16,12 +16,13 @@ PLACEHOLDER_DEFAULT = "粘贴视频链接，每行一条；多条可以换行或
 PLACEHOLDER_BY_PLATFORM = {
     "bilibili": "粘贴 Bilibili 链接；合集可勾选并填 3-7 / 1,3,5 选择要下的分P",
     "douyin": "粘贴抖音链接，每行一条；也可以直接粘分享文案",
+    "xiaohongshu": "粘贴小红书笔记链接，每行一条；图文会按页面张数逐张下载",
 }
 
 
 class DownloadView(ctk.CTkFrame):
     PAGE_TITLE = "下载"
-    PAGE_SUBTITLE = "粘贴链接，批量下载 Bilibili / 抖音 的视频与图文"
+    PAGE_SUBTITLE = "粘贴链接，批量下载 Bilibili / 抖音 / 小红书 的内容"
 
     def __init__(self, master, app):
         super().__init__(master, fg_color="transparent")
@@ -29,6 +30,7 @@ class DownloadView(ctk.CTkFrame):
         self.rows: list[QueueRow] = []
         self._state = "idle"
         self._placeholder_on = False
+        self._placeholder_text = ""
         self._input_enabled = False
         self._log_visible = False
         self._platform_name = PLATFORMS[0].name if PLATFORMS else ""
@@ -75,7 +77,6 @@ class DownloadView(ctk.CTkFrame):
         self.textbox.bind("<Key>", self._on_key)
         self.textbox.bind("<<Paste>>", self._on_paste)
         self.textbox.bind("<KeyRelease>", lambda _e: self._update_counter())
-
         # 登录说明：顺序是"先粘贴、后登录"，用户必须先知道这一步
         ctk.CTkLabel(
             body,
@@ -411,10 +412,12 @@ class DownloadView(ctk.CTkFrame):
         self.textbox.tag_config("placeholder",
                                 foreground=resolve(COLORS["text_faint"]))
         self._placeholder_on = True
+        self._placeholder_text = hint
         self._update_counter()
 
     def _on_focus_in(self, _event=None) -> None:
         self._clear_placeholder()
+        self._update_counter()          # 拿到焦点就按当前内容重算一次
         self._update_counter()
 
     def _on_key(self, event):
@@ -444,18 +447,37 @@ class DownloadView(ctk.CTkFrame):
             self._show_placeholder()
 
     def _is_empty(self) -> bool:
+        return not self._real_text()
+
+    def _real_text(self) -> str:
+        """读输入框真实内容，并把"占位状态"与内容对齐。
+
+        占位标记一旦和控件内容脱节（例如消息框抢焦点、Ctrl+A 删除后重贴），
+        旧逻辑会让 `get_text()` 永远返回空串——用户明明贴了链接，程序却说没有。
+        这里以控件内容为准自愈。
+        """
+        raw = self.textbox.get("1.0", "end-1c")
+        text = raw.strip()
         if self._placeholder_on:
-            return True
-        return not self.textbox.get("1.0", "end-1c").strip()
+            if not text or text == (self._placeholder_text or "").strip():
+                return ""
+            self._placeholder_on = False          # 有真实内容：退出占位状态
+            self.textbox.configure(text_color=COLORS["text"])
+        return text
 
     def get_text(self) -> str:
-        if self._placeholder_on:
-            return ""
-        return self.textbox.get("1.0", "end-1c").strip()
+        return self._real_text()
+
+    def focus_input(self) -> None:
+        """把光标还给输入框（弹过提示框之后用）。"""
+        try:
+            self.textbox.focus_set()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _update_counter(self) -> None:
-        text = "" if self._placeholder_on else self.textbox.get("1.0", "end-1c")
-        urls = self.app.browser.parse_urls(text) if text.strip() else []
+        text = self._real_text()
+        urls = self.app.browser.parse_urls(text) if text else []
         self.counter.configure(
             text=f"{len(urls)} 条" if urls else "",
             text_color=COLORS["accent"] if urls else COLORS["text_faint"],
@@ -515,7 +537,7 @@ class DownloadView(ctk.CTkFrame):
                 pass
             self._parts_timer = None
 
-        text = "" if self._placeholder_on else self.textbox.get("1.0", "end-1c")
+        text = self._real_text()
         urls = self.app.browser.parse_urls(text) if text.strip() else []
         self.refresh_parts(urls)
 

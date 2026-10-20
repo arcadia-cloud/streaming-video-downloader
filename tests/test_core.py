@@ -430,6 +430,129 @@ def test_douyin_classify_photos_vs_video():
     assert classify({}) == "unknown"
 
 
+def test_xhs_match_and_fraction():
+    from core.platforms.xiaohongshu import (
+        XiaohongshuPlatform, _image_key, _parse_fraction,
+    )
+
+    match = XiaohongshuPlatform().match_url
+    assert match("https://www.xiaohongshu.com/explore/65f0abc") is True
+    assert match("http://xhslink.com/aBcDeF") is True
+    # 分享短链现在也会给 .cn 域名
+    assert match("https://xhslink.cn/o/AFbKmN3zQa9") is True
+    assert match("https://www.xiaohongshu.cn/explore/x") is True
+    assert match("https://www.douyin.com/note/123") is False
+
+    # 页码分母就是图片张数，决定监听等待的 count
+    assert _parse_fraction("1/7") == 7
+    assert _parse_fraction("3 / 12") == 12
+    assert _parse_fraction("999+") == 0
+    assert _parse_fraction("") == 0
+    assert _parse_fraction("1/500") == 0
+
+    # 同一张图的不同规格共用 key，不同图不能合并
+    base = ("https://sns-webpic-qc.xhscdn.com/2024/notes_pre_post/"
+            "1040g2t3abc/nd_dft_wlteh_1.jpg")
+    assert _image_key(base) == _image_key(base + "!nd_dft_wgth_2")
+    assert _image_key(base) != _image_key(base.replace("wlteh_1", "wlteh_9"))
+    assert _image_key(base + "?x=1") == _image_key(base)
+
+
+def test_parse_urls_keeps_input_order():
+    """混粘贴：返回顺序必须等于粘贴顺序，不能按平台分组。"""
+    from core.browser import BrowserManager
+
+    manager = BrowserManager()
+    mixed = ("https://www.xiaohongshu.com/explore/65f0abc\n"
+             "7.68 复制打开抖音 https://v.douyin.com/xoX8jk0JOhY/ 5pm\n"
+             "https://www.bilibili.com/video/BV1xx411c7mD?p=3")
+    urls = manager.parse_urls(mixed)
+    assert len(urls) == 3, urls
+    assert "xiaohongshu" in urls[0], urls
+    assert "douyin" in urls[1], urls
+    assert "bilibili" in urls[2], urls
+
+    # 同一条链接重复粘贴只保留一次，位置取第一次出现
+    assert len(manager.parse_urls(urls[0] + "\n" + urls[0])) == 1
+
+
+def test_xhs_title_sanitized():
+    """小红书标题常带 | 和 \\，不清洗会在建目录时 WinError 123。"""
+    from core.platforms.xiaohongshu import XiaohongshuPlatform
+
+    platform = XiaohongshuPlatform()
+    raw = "「Weissfluhgipfel · 雪国序章」蓝白调 | 阿尔卑斯的高空缆车 \\ #雪山"
+    name = platform.sanitize_filename(raw)
+    assert not (set('\\/:*?"<>|') & set(name)), name
+    assert name, "清洗后不能为空"
+
+
+def test_parse_urls_falls_back_on_unknown_domain():
+    """域名认不出来时，用文案关键词兜底；无关链接仍然丢弃。"""
+    from core.browser import BrowserManager
+
+    manager = BrowserManager()
+
+    # 分享短链换顶级域也认（xhslink.*）
+    assert manager.resolve_platform("https://xhslink.cc/o/abc").name \
+        == "xiaohongshu"
+
+    # 完全陌生的域名 + 文案提到小红书 → 兜底成小红书
+    text = "最新的3D功能 … https://link.example.net/o/AbC123 去【小红书】看看"
+    urls = manager.parse_urls(text)
+    assert len(urls) == 1, urls
+    assert manager.resolve_platform(urls[0], text).name == "xiaohongshu"
+
+    # 没有平台关键词的普通链接不硬猜
+    assert manager.parse_urls("见 https://example.com/a") == []
+
+
+def test_xhs_detail_url_rewrite():
+    """四种入口都归一成 pc_feed：app_share 会渲染成浮层、抓不到请求。"""
+    from core.platforms.xiaohongshu import XiaohongshuPlatform
+
+    fix = XiaohongshuPlatform._detail_url
+    variants = [
+        "https://www.xiaohongshu.com/explore/6ac906b1000000001a028368"
+        "?app_platform=ios&xsec_source=app_share&xsec_token=ABC&xhsshare=CopyLink",
+        "https://www.xiaohongshu.com/explore/6ac906b1000000001a028368"
+        "?xsec_token=ABC&xsec_source=app_share",
+        "https://www.xiaohongshu.com/explore/6ac906b1000000001a028368"
+        "?xsec_token=ABC&xsec_source=pc_feed",
+        "https://www.xiaohongshu.com/discovery/item/6ac906b1000000001a028368"
+        "?xsec_token=ABC",
+    ]
+    for url in variants:
+        out = fix(url)
+        assert "/explore/6ac906b1000000001a028368" in out, out
+        assert "xsec_source=pc_feed" in out, out
+        assert "xsec_token=ABC" in out, out
+        assert "app_platform" not in out, out
+        assert "/discovery/item/" not in out, out
+
+    # 不是笔记地址就原样返回
+    assert fix("https://xhslink.cn/o/AbC") == "https://xhslink.cn/o/AbC"
+
+
+def test_xhs_concurrency_scales_with_count():
+    """并发路数随图片张数自适应，且有上限。"""
+    from core.platforms.xiaohongshu import MAX_CONCURRENCY, _concurrency
+
+    assert _concurrency(1) == 1          # 单张没必要开线程
+    assert _concurrency(2) == 2
+    assert _concurrency(3) == 3
+    assert _concurrency(4) == 4
+    assert _concurrency(8) == 4
+    assert _concurrency(9) == 6
+    assert _concurrency(20) == 6
+    assert _concurrency(21) == MAX_CONCURRENCY
+    assert _concurrency(50) == MAX_CONCURRENCY
+    # 单调不降，且永不越界
+    values = [_concurrency(n) for n in range(0, 60)]
+    assert values == sorted(values)
+    assert max(values) <= MAX_CONCURRENCY
+
+
 def main() -> int:
     tests = [(name, obj) for name, obj in sorted(globals().items())
              if name.startswith("test_") and callable(obj)]

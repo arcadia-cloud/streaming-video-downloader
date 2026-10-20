@@ -19,6 +19,7 @@ import customtkinter as ctk
 
 from core import config as app_config
 from core import media
+from core import urls as url_tools
 from core.browser import BrowserManager
 from core.platforms import PLATFORMS
 from core.platforms.bilibili import page_url, parse_parts
@@ -303,6 +304,7 @@ class App(ctk.CTk):
             self._log("检测到你已关闭浏览器，正在重新启动", "warn")
         if self.browser.page is None:
             self.browser.launch()
+            self._log(f"浏览器：{self.browser.browser_label()}")
         else:
             try:
                 self.browser.page.get(self.browser.platform.login_url())
@@ -381,7 +383,23 @@ class App(ctk.CTk):
         self.download_view.flush_parts()
 
         urls = self._filter_plugins(self.browser.parse_urls(text))
+        if urls:
+            self._log(f"识别到 {len(urls)} 条链接")
         if not urls:
+            self.download_view.focus_input()
+            # 分清"完全没链接"和"有链接但不支持"——后者多半是域名变了
+            seen = [c for c in url_tools.iter_candidates(text) if "." in c]
+            if seen:
+                hosts = sorted({c.split("//")[-1].split("/")[0] for c in seen})[:3]
+                messagebox.showwarning(
+                    "链接不在支持范围",
+                    "识别到了链接，但不属于已支持的平台：\n\n"
+                    + "\n".join(hosts)
+                    + "\n\n目前支持 Bilibili、抖音、小红书。",
+                    parent=self,
+                )
+                self._log(f"不支持的域名：{'、'.join(hosts)}", "warn")
+                return None
             messagebox.showwarning(
                 "没有识别到链接",
                 "输入框里没有可识别的视频链接。\n\n"
@@ -396,13 +414,14 @@ class App(ctk.CTk):
         tasks: list[tuple] = []
         unrouted: list[str] = []
         for url in urls:
-            platform = self.browser.get_platform_for_url(url)
+            platform = self.browser.resolve_platform(url, text)
             if platform is None:
                 unrouted.append(url)
                 continue
             tasks.append((platform, url))
 
         if unrouted and not tasks:
+            self.download_view.focus_input()
             messagebox.showwarning(
                 "链接不属于已支持的平台",
                 "识别到了链接，但没有一条属于 Bilibili 或 抖音：\n\n"
@@ -461,22 +480,31 @@ class App(ctk.CTk):
         return expanded
 
     def _confirm_platform(self, tasks: list[tuple]) -> bool:
-        """链接平台与当前选择不一致时先问一句，避免"选错平台"白跑一趟。"""
+        """链接平台与当前选择不一致时：只有一家就自动切，跨平台才问。"""
         current = self.browser.platform
+        names = {platform.name for platform, _url in tasks}
+
+        if names == {current.name}:
+            return True
+
+        # 全是同一个平台的（比如小红书分享短链 + 网页链接）：直接切，不打扰
+        if len(names) == 1:
+            target = next(platform for platform, _url in tasks)
+            self._log(f"链接属于「{target.display_name}」，已自动切换平台")
+            self.set_platform(target.name)
+            return True
+
         others: dict[str, int] = {}
         for platform, _url in tasks:
             if platform is not current:
                 others[platform.display_name] = (
                     others.get(platform.display_name, 0) + 1)
-        if not others:
-            return True
-
         detail = "、".join(f"{name} {count} 条" for name, count in others.items())
         return messagebox.askokcancel(
-            "平台可能选错了",
-            f"当前选择的是「{current.display_name}」，但识别到 {detail} 链接。\n\n"
+            "一次粘贴了多个平台",
+            f"当前选择的是「{current.display_name}」，另外还有 {detail}。\n\n"
             "程序会按每条链接自己的平台下载，但浏览器只在当前平台完成登录，"
-            "另一个平台可能取不到数据。\n\n"
+            "另一个平台可能取不到数据。需要的话分两批更稳。\n\n"
             "点「确定」继续，点「取消」返回修改。",
             parent=self,
         )
